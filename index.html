@@ -58,7 +58,10 @@
     flex:1;position:relative;overflow:auto;
     background:#e2e4e7;
     touch-action: pan-x pan-y;
+    display:flex; align-items:flex-end; justify-content:center;
+    padding-bottom:env(safe-area-inset-bottom, 0px);
   }
+  #scene{flex:none;}
   #zoomControls{
     position:fixed;right:14px;bottom:18px;z-index:60;
     display:flex;flex-direction:column;gap:8px;
@@ -1344,10 +1347,10 @@ function applyZoom(){
   if(!baseSvgWidth || !baseSvgHeight) return;
   svg.setAttribute('width', baseSvgWidth*zoomScale);
   svg.setAttribute('height', baseSvgHeight*zoomScale);
-  const availW = sceneWrap.clientWidth, availH = sceneWrap.clientHeight;
-  const scaledW = baseSvgWidth*zoomScale, scaledH = baseSvgHeight*zoomScale;
-  scene.style.marginLeft = scaledW < availW ? `${(availW-scaledW)/2}px` : '0px';
-  scene.style.marginTop = scaledH < availH ? `${availH-scaledH}px` : '0px';
+  // centering/bottom-anchoring is handled by CSS flexbox on #scene-wrap now —
+  // no JS margin math needed, so it can't go stale when the browser's own UI
+  // chrome (address bar, iOS home indicator) changes the visible viewport height
+  // after the fact.
 }
 
 function dist(t0, t1){
@@ -1510,6 +1513,11 @@ if(hadSavedData && hasAnyPeople()){
   requestAnimationFrame(()=> requestAnimationFrame(autoFitZoom));
 }
 window.addEventListener('resize', render);
+if(window.visualViewport){
+  // iOS Safari's address bar/toolbar can show or hide without firing a normal
+  // window resize event — this keeps the fit in sync when that happens.
+  window.visualViewport.addEventListener('resize', render);
+}
 </script>
 </body>
 </html>
