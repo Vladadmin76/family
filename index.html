@@ -410,6 +410,41 @@ function fillUnknownPerson(personId, data){
   return p;
 }
 
+// Removes a person while keeping the rest of the tree structurally valid:
+// - if they were someone's child, they're dropped from that union's list
+// - if they were a partner in a union THAT HAS CHILDREN, they're replaced by a
+//   fresh "?" placeholder (so those children keep a valid parent link) instead
+//   of leaving a dangling reference
+// - if they were a partner in a union with no children, that union is simply
+//   removed and the other partner loses the spouse link
+function deletePerson(personId){
+  const p = state.people[personId];
+  if(!p) return;
+
+  if(p.parentUnionId){
+    const pu = state.unions[p.parentUnionId];
+    if(pu) pu.childrenIds = pu.childrenIds.filter(id=>id!==personId);
+  }
+
+  (p.spouseUnionIds||[]).slice().forEach(uid=>{
+    const u = state.unions[uid];
+    if(!u) return;
+    const spouseId = u.partner1Id===personId ? u.partner2Id : u.partner1Id;
+    if(u.childrenIds && u.childrenIds.length>0){
+      const unk = newPerson({isUnknown:true});
+      unk.spouseUnionIds.push(u.id);
+      if(u.partner1Id===personId) u.partner1Id = unk.id; else u.partner2Id = unk.id;
+    } else {
+      if(spouseId && state.people[spouseId]){
+        state.people[spouseId].spouseUnionIds = state.people[spouseId].spouseUnionIds.filter(id=>id!==uid);
+      }
+      delete state.unions[uid];
+    }
+  });
+
+  delete state.people[personId];
+}
+
 function hasAnyPeople(){
   return Object.values(state.people).some(p=>!p.isUnknown);
 }
@@ -785,6 +820,7 @@ function openAddPopover(personId, clientX, clientY){
   const pop = document.createElement('div');
   pop.className = 'add-popover';
   const options = [
+    {label:'Основное', tab:'main'},
     {label:'Родители', tab:'parents'},
     {label:'Супруг(а)', tab:'spouse'},
     {label:'Дети', tab:'children'},
@@ -818,7 +854,7 @@ function openPersonModal(personId, initialTab){
   renderPersonModal(personId);
 }
 
-function renderPersonModal(personId){
+function renderPersonModal(personId, flashSaved){
   const p = state.people[personId];
   const backdrop = document.createElement('div');
   backdrop.className='modal-backdrop';
@@ -849,7 +885,7 @@ function renderPersonModal(personId){
   });
 
   const body = backdrop.querySelector('#modalBody');
-  if(currentTab==='main') renderMainTab(body, p);
+  if(currentTab==='main') renderMainTab(body, p, flashSaved);
   if(currentTab==='spouse') renderSpouseTab(body, p);
   if(currentTab==='children') renderChildrenTab(body, p);
   if(currentTab==='parents') renderParentsTab(body, p);
@@ -874,14 +910,17 @@ function wireRadioHighlight(container){
   });
 }
 
-function renderMainTab(body, p){
+function renderMainTab(body, p, justSaved){
   const isAlive = !p.deathDate;
   const lived = lifespanYears(p);
   let summaryHtml = '';
+  if(justSaved){
+    summaryHtml += `<div class="life-summary" id="savedFlash" style="background:#e3f6e8;color:#1e7a34;font-weight:600;">Сохранено ✓</div>`;
+  }
   if(!p.isUnknown && p.deathDate && lived!=null){
-    summaryHtml = `<div class="life-summary">Прожил(а) ${lived} ${pluralYears(lived)}.</div>`;
+    summaryHtml += `<div class="life-summary">Прожил(а) ${lived} ${pluralYears(lived)}.</div>`;
   } else if(!p.isUnknown && p.deathDate){
-    summaryHtml = `<div class="life-summary">Умер(ла) — годы жизни не полностью известны.</div>`;
+    summaryHtml += `<div class="life-summary">Умер(ла) — годы жизни не полностью известны.</div>`;
   }
   body.innerHTML = `
     ${p.isUnknown?'<p class="hint-text">Этот человек пока отмечен как неизвестный (?). Заполните данные, если они найдутся.</p>':''}
@@ -905,6 +944,7 @@ function renderMainTab(body, p){
       <div class="field" id="deathField" style="${isAlive?'display:none;':''}"><label>Дата смерти</label><input id="f_death" type="date" value="${esc(p.deathDate)}"></div>
     </div>
     <button class="btn primary" id="saveMain" style="width:100%;">Сохранить</button>
+    <button class="btn danger" id="deleteMainBtn" style="width:100%;margin-top:10px;">Удалить этого человека</button>
   `;
   wireRadioHighlight(body);
   body.querySelectorAll('input[name=f_alive]').forEach(r=>{
@@ -923,8 +963,23 @@ function renderMainTab(body, p){
     p.deathDate = (aliveInput && aliveInput.value==='dead') ? body.querySelector('#f_death').value : '';
     if(p.isUnknown && p.firstName) p.isUnknown = false;
     render();
-    renderPersonModal(p.id);
+    renderPersonModal(p.id, true);
   };
+  body.querySelector('#deleteMainBtn').onclick = ()=> confirmDeletePerson(p.id);
+
+  if(justSaved){
+    const flashBtn = body.querySelector('#saveMain');
+    flashBtn.textContent = 'Сохранено ✓';
+    setTimeout(()=>{
+      const flashEl = body.querySelector('#savedFlash');
+      if(flashEl){
+        flashEl.style.transition = 'opacity 0.5s';
+        flashEl.style.opacity = '0';
+        setTimeout(()=> flashEl.remove(), 500);
+      }
+      if(body.contains(flashBtn)) flashBtn.textContent = 'Сохранить';
+    }, 1300);
+  }
 }
 function pluralYears(n){
   const n10 = n%10, n100 = n%100;
@@ -1706,6 +1761,31 @@ function openDescriptionModal(){
   modalRoot.appendChild(backdrop);
   backdrop.querySelector('.modal-close').onclick = closeModal;
   backdrop.addEventListener('click', e=>{ if(e.target===backdrop) closeModal(); });
+}
+
+function confirmDeletePerson(personId){
+  const p = state.people[personId];
+  const hasKids = personChildren(personId).length > 0;
+  const backdrop = document.createElement('div');
+  backdrop.className='modal-backdrop';
+  backdrop.innerHTML = `
+    <div class="modal">
+      <div class="modal-header"><h2>Удалить человека?</h2><button class="modal-close">&times;</button></div>
+      <div class="modal-body">
+        <p class="hint-text">«${esc(fullName(p))}» будет удалён(а) из древа без возможности восстановления.${hasKids?' Дети останутся в древе — на месте этого человека появится карточка «?», чтобы связи с детьми не потерялись.':''}</p>
+        <button class="btn danger" id="confirmDeleteBtn" style="width:100%;margin-bottom:8px;">Да, удалить</button>
+        <button class="btn" id="cancelDeleteBtn" style="width:100%;">Отмена</button>
+      </div>
+    </div>`;
+  modalRoot.appendChild(backdrop);
+  backdrop.querySelector('.modal-close').onclick = closeModal;
+  backdrop.querySelector('#cancelDeleteBtn').onclick = closeModal;
+  backdrop.querySelector('#confirmDeleteBtn').onclick = ()=>{
+    deletePerson(personId);
+    closeModal();
+    render();
+    autoFitZoom();
+  };
 }
 
 function confirmResetAllData(){
