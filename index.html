@@ -58,16 +58,15 @@
     flex:1;position:relative;overflow:auto;
     background:#e2e4e7;
     touch-action: pan-x pan-y;
-    display:flex;
     padding-bottom:env(safe-area-inset-bottom, 0px);
   }
-  /* Centering is done with auto margins on the child, NOT align-items/justify-content
-     on the flex container — WebKit (Safari/Chrome on iOS) has a long-standing bug
-     where a scrollable flex container with non-default align-items breaks scrolling
-     in the cross-axis direction (here: vertical), while the main-axis (horizontal)
-     scroll keeps working — which is exactly the "left-right works, up-down doesn't"
-     symptom. Auto margins achieve the same visual centering without that bug. */
-  #scene{flex:none; position:relative; margin:auto auto 0 auto;}
+  /* NOT flexbox here on purpose — WebKit (Safari/Chrome on iOS) has a long-standing
+     bug where a scrollable flex container can break panning in one axis once content
+     overflows, and it turns out this isn't limited to align-items: even the auto-margin
+     variant we tried could still misbehave once overflow was only partial. Plain block
+     layout with JS-computed margins (recomputed on every zoom/resize) sidesteps the
+     bug family entirely, at the cost of a little JS bookkeeping. */
+  #scene{position:relative;}
   #cardLayer{position:absolute; left:0; top:0; width:100%; height:100%; pointer-events:none;}
   #cardLayer .person-card{pointer-events:auto;}
   #zoomControls{
@@ -282,6 +281,7 @@ const IMG_AVATAR_FEMALE = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAFAAAAB
 let state = { people: {}, unions: {} };
 let counter = 1;
 let baseSvgWidth = 0, baseSvgHeight = 0, baseMinX = 0, baseMinY = 0;
+let placedPersonIds = null; // Set, reset at the start of each buildLayout() call
 let cardNodes = [];
 function uid(prefix){ return prefix + (counter++); }
 
@@ -515,26 +515,13 @@ function findRootPersons(){
         if(!compVisited.has(n)){ compVisited.add(n); queue.push(n); }
       });
     }
-    // within this component, the true root is whoever has no parentUnionId AND
-    // whose spouse(s) also have no parentUnionId — i.e. neither side of the
-    // bottom-most couple has deeper known ancestry. Falls back to any
-    // no-parent member if the component is asymmetric (one spouse's side is
-    // known deeper than the other's) or has none (shouldn't normally happen).
-    const noParent = comp.filter(id=>!state.people[id].parentUnionId);
-    let rootId;
-    if(noParent.length===0){
-      rootId = comp[0];
-    } else {
-      rootId = noParent.find(id=>{
-        const p = state.people[id];
-        return (p.spouseUnionIds||[]).every(uid=>{
-          const u = state.unions[uid];
-          const sid = u.partner1Id===id ? u.partner2Id : u.partner1Id;
-          return sid ? !state.people[sid].parentUnionId : true;
-        });
-      }) || noParent[0];
-    }
-    roots.push(rootId);
+    // Any member of the component works as the entry point now — each row
+    // pulls in its own ancestors (both spouses' sides) via parentBlocks in
+    // measureWidth/placeNode, so we no longer need to hunt for "the" bottom-most
+    // no-parent couple. (We used to prefer a no-parent member here, but that
+    // caused the SAME ancestor couple to be built twice: once as the chosen
+    // root, and again as another row's parentBlock pointing at that same union.)
+    roots.push(comp[0]);
   });
   return roots;
 }
@@ -583,17 +570,64 @@ function ownRowWidth(personId){
 
 function measureWidth(node){
   if(node.type==='leaf'){ node.width = LEAF_SLOT; return node.width; }
-  const kids = splitChildren(node.id);
-  node.childNodes = kids;
+  if(placedPersonIds.has(node.id)){
+    // This exact person already has a card placed somewhere else in the tree
+    // (reachable via a different sibling/spouse path — quite common once a
+    // tree has several marriages). Don't build a second copy of them and their
+    // whole ancestry again: leave this reference zero-width, and the connector
+    // pass will draw a line straight to the ALREADY-placed card instead.
+    node.width = 0;
+    node.alreadyPlacedElsewhere = true;
+    return 0;
+  }
+  placedPersonIds.add(node.id);
   const own = ownRowWidth(node.id);
-  if(kids.length===0){ node.width = own; return node.width; }
-  let w = 0;
-  kids.forEach((cn,i)=>{ w += measureWidth(cn); if(i>0) w += SIBLING_GAP; });
-  node.width = Math.max(w, own);
+
+  // A "parent block" (someone's ancestors, shown below their row) must NOT
+  // re-expand its own children upward — that child is exactly the descendant
+  // we reached it from, so doing so would walk right back into the tree we're
+  // already building and recurse forever. Parent blocks only ever grow further
+  // BACKWARD (their own parents), never forward again.
+  let upWidth = own;
+  if(!node.isParentBlock){
+    const kids = splitChildren(node.id);
+    node.childNodes = kids;
+    if(kids.length){
+      let w = 0;
+      kids.forEach((cn,i)=>{ w += measureWidth(cn); if(i>0) w += SIBLING_GAP; });
+      upWidth = Math.max(w, own);
+    }
+  } else {
+    node.childNodes = [];
+  }
+
+  // Every member of this row (the primary person AND each of their spouses) may
+  // have their OWN separate parents — a married-in spouse's ancestry is just as
+  // real as the primary person's, so we build a downward "parent block" for each
+  // distinct parentUnionId found among the row's members, not just the primary's.
+  const members = [node.id, ...personSpouses(node.id).map(s=>s.personId)];
+  const seenParentUnion = new Set();
+  const parentBlocks = [];
+  members.forEach(mid=>{
+    const mp = state.people[mid];
+    if(mp.parentUnionId && !seenParentUnion.has(mp.parentUnionId)){
+      seenParentUnion.add(mp.parentUnionId);
+      const pu = state.unions[mp.parentUnionId];
+      const pnode = {type:'person', id: pu.partner1Id, isParentBlock:true};
+      measureWidth(pnode);
+      parentBlocks.push(pnode);
+    }
+  });
+  node.parentBlocks = parentBlocks;
+  let downWidth = 0;
+  parentBlocks.forEach((pb,i)=>{ downWidth += pb.width; if(i>0) downWidth += SIBLING_GAP; });
+
+  node.width = Math.max(upWidth, downWidth, own);
   return node.width;
 }
 
 function placeNode(node, xStart, level, out){
+  if(node.alreadyPlacedElsewhere){ node.x = xStart; node.level = level; return; }
   node.level = level;
   if(node.type==='leaf'){
     node.x = xStart + node.width/2;
@@ -612,9 +646,22 @@ function placeNode(node, xStart, level, out){
     node.x = xStart + node.width/2;
   }
   out.push(node);
+
+  // place this row's downward parent-block(s) — the primary's parents and/or
+  // any spouse's parents — centered as a group below this row
+  if(node.parentBlocks && node.parentBlocks.length){
+    let downWidthTotal = 0;
+    node.parentBlocks.forEach((pb,i)=>{ downWidthTotal += pb.width; if(i>0) downWidthTotal += SIBLING_GAP; });
+    let dcursor = node.x - downWidthTotal/2;
+    node.parentBlocks.forEach(pb=>{
+      placeNode(pb, dcursor, level-1, out);
+      dcursor += pb.width + SIBLING_GAP;
+    });
+  }
 }
 
 function buildLayout(){
+  placedPersonIds = new Set();
   const roots = findRootPersons();
   const allNodes = [];
   let xOffset = 40;
@@ -725,20 +772,29 @@ function render(){
     if(node.type!=='person') return;
     const bottomY = yFor(node.level);
     const topY = bottomY - CARD_H;
-    const p = state.people[node.id];
 
-    if(p.parentUnionId){
-      const pu = state.unions[p.parentUnionId];
-      const parentIds = [pu.partner1Id, pu.partner2Id].filter(Boolean);
-      const parentNode = parentIds.map(pid=>nodeByPersonId[pid]).find(Boolean);
-      if(parentNode){
-        const cardX = node.x - ownRowWidth(node.id)/2 + CARD_W/2;
-        const px = parentNode.x;
-        const py = yFor(parentNode.level);
-        const barY = (bottomY + py)/2;
-        svg.appendChild(el('path', {d:`M ${cardX} ${bottomY} L ${cardX} ${barY} L ${px} ${barY} L ${px} ${py-CARD_H}`, class:'conn-line'}));
+    // a down-connector for EVERY member of this row who has parents — the
+    // primary person AND any spouse each get their own line to their own
+    // parents, since a married-in spouse's ancestry is separate from the
+    // primary's and must not be skipped
+    const rowW = ownRowWidth(node.id);
+    const rowMembers = [node.id, ...personSpouses(node.id).map(s=>s.personId)];
+    let memberCx = node.x - rowW/2 + CARD_W/2;
+    rowMembers.forEach(mid=>{
+      const mp = state.people[mid];
+      if(mp.parentUnionId){
+        const pu = state.unions[mp.parentUnionId];
+        const parentIds = [pu.partner1Id, pu.partner2Id].filter(Boolean);
+        const parentNode = parentIds.map(pid=>nodeByPersonId[pid]).find(Boolean);
+        if(parentNode){
+          const px = parentNode.x;
+          const py = yFor(parentNode.level);
+          const barY = (bottomY + py)/2;
+          svg.appendChild(el('path', {d:`M ${memberCx} ${bottomY} L ${memberCx} ${barY} L ${px} ${barY} L ${px} ${py-CARD_H}`, class:'conn-line'}));
+        }
       }
-    }
+      memberCx += CARD_W + CARD_GAP;
+    });
 
     if(node.childNodes && node.childNodes.length){
       const childTops = node.childNodes.map(cn=>({x:cn.x, y:yFor(cn.level)}));
@@ -1636,10 +1692,10 @@ function applyZoom(){
   if(!baseSvgWidth || !baseSvgHeight) return;
   svg.setAttribute('width', baseSvgWidth*zoomScale);
   svg.setAttribute('height', baseSvgHeight*zoomScale);
-  // centering/bottom-anchoring is handled by CSS flexbox on #scene-wrap now —
-  // no JS margin math needed, so it can't go stale when the browser's own UI
-  // chrome (address bar, iOS home indicator) changes the visible viewport height
-  // after the fact.
+  const availW = sceneWrap.clientWidth, availH = sceneWrap.clientHeight;
+  const scaledW = baseSvgWidth*zoomScale, scaledH = baseSvgHeight*zoomScale;
+  scene.style.marginLeft = scaledW < availW ? `${(availW-scaledW)/2}px` : '0px';
+  scene.style.marginTop = scaledH < availH ? `${availH-scaledH}px` : '0px';
   positionCards();
 }
 
@@ -1666,6 +1722,39 @@ function dist(t0, t1){
   return Math.sqrt(dx*dx + dy*dy);
 }
 
+// Changes zoomScale while keeping the content under (screenX, screenY) fixed on
+// screen — without this, zooming re-centers on the content's top-left corner and
+// the spot you actually pinched on drifts away, which is very disorienting on a
+// tree with many cards.
+function zoomAt(newScale, screenX, screenY){
+  newScale = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, newScale));
+  if(newScale === zoomScale) return;
+  const rect = sceneWrap.getBoundingClientRect();
+  const localX = screenX - rect.left, localY = screenY - rect.top;
+  const oldMarginLeft = parseFloat(scene.style.marginLeft) || 0;
+  const oldMarginTop = parseFloat(scene.style.marginTop) || 0;
+  const contentX = sceneWrap.scrollLeft + localX - oldMarginLeft;
+  const contentY = sceneWrap.scrollTop + localY - oldMarginTop;
+  const ratio = newScale / zoomScale;
+
+  zoomScale = newScale;
+  applyZoom();
+
+  const newMarginLeft = parseFloat(scene.style.marginLeft) || 0;
+  const newMarginTop = parseFloat(scene.style.marginTop) || 0;
+  const targetScrollLeft = contentX*ratio + newMarginLeft - localX;
+  const targetScrollTop = contentY*ratio + newMarginTop - localY;
+  sceneWrap.scrollLeft = targetScrollLeft;
+  sceneWrap.scrollTop = targetScrollTop;
+  // some browsers clamp an immediate scroll assignment to the pre-resize bounds
+  // when it's set in the same tick as the size change; re-applying on the next
+  // animation frame guarantees it actually sticks once layout has caught up
+  requestAnimationFrame(()=>{
+    sceneWrap.scrollLeft = targetScrollLeft;
+    sceneWrap.scrollTop = targetScrollTop;
+  });
+}
+
 let pinchStartDist = null, pinchStartScale = null;
 sceneWrap.addEventListener('touchstart', (e)=>{
   if(e.touches.length===2){
@@ -1677,10 +1766,10 @@ sceneWrap.addEventListener('touchmove', (e)=>{
   if(e.touches.length===2 && pinchStartDist){
     e.preventDefault();
     const d = dist(e.touches[0], e.touches[1]);
-    let ns = pinchStartScale * (d / pinchStartDist);
-    ns = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, ns));
-    zoomScale = ns;
-    applyZoom();
+    const ns = pinchStartScale * (d / pinchStartDist);
+    const midX = (e.touches[0].clientX + e.touches[1].clientX)/2;
+    const midY = (e.touches[0].clientY + e.touches[1].clientY)/2;
+    zoomAt(ns, midX, midY);
   }
 }, {passive:false});
 sceneWrap.addEventListener('touchend', (e)=>{
@@ -1690,18 +1779,17 @@ sceneWrap.addEventListener('touchend', (e)=>{
 sceneWrap.addEventListener('wheel', (e)=>{
   if(e.ctrlKey || e.metaKey){
     e.preventDefault();
-    zoomScale = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, zoomScale - e.deltaY*0.01));
-    applyZoom();
+    zoomAt(zoomScale - e.deltaY*0.01, e.clientX, e.clientY);
   }
 }, {passive:false});
 
 document.getElementById('zoomIn').onclick = ()=>{
-  zoomScale = Math.min(ZOOM_MAX, zoomScale + 0.2);
-  applyZoom();
+  const rect = sceneWrap.getBoundingClientRect();
+  zoomAt(zoomScale + 0.2, rect.left + rect.width/2, rect.top + rect.height/2);
 };
 document.getElementById('zoomOut').onclick = ()=>{
-  zoomScale = Math.max(ZOOM_MIN, zoomScale - 0.2);
-  applyZoom();
+  const rect = sceneWrap.getBoundingClientRect();
+  zoomAt(zoomScale - 0.2, rect.left + rect.width/2, rect.top + rect.height/2);
 };
 
 function autoFitZoom(){
