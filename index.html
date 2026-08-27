@@ -515,13 +515,16 @@ function findRootPersons(){
         if(!compVisited.has(n)){ compVisited.add(n); queue.push(n); }
       });
     }
-    // Any member of the component works as the entry point now — each row
-    // pulls in its own ancestors (both spouses' sides) via parentBlocks in
-    // measureWidth/placeNode, so we no longer need to hunt for "the" bottom-most
-    // no-parent couple. (We used to prefer a no-parent member here, but that
-    // caused the SAME ancestor couple to be built twice: once as the chosen
-    // root, and again as another row's parentBlock pointing at that same union.)
-    roots.push(comp[0]);
+    // Prefer a person with NO recorded parents as the entry point — they sit
+    // at the very top of their lineage, so the whole component cascades
+    // downward from them naturally with no "childless root centered under an
+    // inherited width" mismatch. (Any member would technically still work,
+    // since parentBlocks now pull in ancestors from wherever we start — but
+    // starting from a random deep-in-the-tree, childless, spouseless person
+    // makes their own single-card row get centered under a much wider
+    // inherited slot, which can visually land on top of a sibling's card.)
+    const noParent = comp.find(id=>!state.people[id].parentUnionId);
+    roots.push(noParent || comp[0]);
   });
   return roots;
 }
@@ -568,37 +571,57 @@ function ownRowWidth(personId){
   return (1+spouses.length)*CARD_W + spouses.length*CARD_GAP;
 }
 
+// The exact screen X of a node's OWN card — as opposed to node.x, which for a
+// married node is the midpoint of the whole couple's row. Every 'person' node
+// is always anchored on its primary (their spouse, if any, is drawn after
+// them), so this is what a connector line should point to when the line is
+// about that SPECIFIC person, not their marriage.
+function primaryCardCx(node){
+  if(node.type==='leaf') return node.x;
+  return node.x - ownRowWidth(node.id)/2 + CARD_W/2;
+}
+
 function measureWidth(node){
-  if(node.type==='leaf'){ node.width = LEAF_SLOT; return node.width; }
   if(placedPersonIds.has(node.id)){
     // This exact person already has a card placed somewhere else in the tree
     // (reachable via a different sibling/spouse path — quite common once a
-    // tree has several marriages). Don't build a second copy of them and their
-    // whole ancestry again: leave this reference zero-width, and the connector
-    // pass will draw a line straight to the ALREADY-placed card instead.
+    // tree has several marriages). Don't build a second copy of them (or, for
+    // a couple, of their whole ancestry) again: leave this reference
+    // zero-width, and the connector pass will draw a line straight to the
+    // ALREADY-placed card instead. This check has to apply to leaf nodes too —
+    // a childless person can just as easily be reachable from two directions
+    // once their OWN parents are looked up from a different in-law's side.
     node.width = 0;
     node.alreadyPlacedElsewhere = true;
     return 0;
   }
+  if(node.type==='leaf'){
+    placedPersonIds.add(node.id);
+    node.width = LEAF_SLOT;
+    return node.width;
+  }
   placedPersonIds.add(node.id);
+  // A spouse shown in this same row is just as "placed" as the primary — if we
+  // only marked the primary, a spouse who is independently reachable as
+  // somebody else's child (via their own parentUnionId) would look unplaced
+  // and get built again as a whole second copy of this same couple.
+  personSpouses(node.id).forEach(s=> placedPersonIds.add(s.personId));
   const own = ownRowWidth(node.id);
 
-  // A "parent block" (someone's ancestors, shown below their row) must NOT
-  // re-expand its own children upward — that child is exactly the descendant
-  // we reached it from, so doing so would walk right back into the tree we're
-  // already building and recurse forever. Parent blocks only ever grow further
-  // BACKWARD (their own parents), never forward again.
+  // Always expand this row's own children upward too — even for a "parent
+  // block" reached by descending from a child. This is what discovers that
+  // child's SIBLINGS (everyone else sharing this same parent union), which
+  // would otherwise silently vanish. The placedPersonIds guard above (and the
+  // per-node check at the top of this function) is what stops this from
+  // walking straight back into the descendant we came from and recursing
+  // forever — not disabling the expansion itself.
+  const kids = splitChildren(node.id);
+  node.childNodes = kids;
   let upWidth = own;
-  if(!node.isParentBlock){
-    const kids = splitChildren(node.id);
-    node.childNodes = kids;
-    if(kids.length){
-      let w = 0;
-      kids.forEach((cn,i)=>{ w += measureWidth(cn); if(i>0) w += SIBLING_GAP; });
-      upWidth = Math.max(w, own);
-    }
-  } else {
-    node.childNodes = [];
+  if(kids.length){
+    let w = 0;
+    kids.forEach((cn,i)=>{ w += measureWidth(cn); if(i>0) w += SIBLING_GAP; });
+    upWidth = Math.max(w, own);
   }
 
   // Every member of this row (the primary person AND each of their spouses) may
@@ -613,7 +636,7 @@ function measureWidth(node){
     if(mp.parentUnionId && !seenParentUnion.has(mp.parentUnionId)){
       seenParentUnion.add(mp.parentUnionId);
       const pu = state.unions[mp.parentUnionId];
-      const pnode = {type:'person', id: pu.partner1Id, isParentBlock:true};
+      const pnode = {type:'person', id: pu.partner1Id, isParentBlock:true, ownerMemberId: mid};
       measureWidth(pnode);
       parentBlocks.push(pnode);
     }
@@ -640,22 +663,46 @@ function placeNode(node, xStart, level, out){
     cursor += cn.width + SIBLING_GAP;
   });
   if(node.childNodes && node.childNodes.length){
-    const first = node.childNodes[0], last = node.childNodes[node.childNodes.length-1];
-    node.x = (first.x + last.x)/2;
+    const realKids = node.childNodes.filter(cn=>!cn.alreadyPlacedElsewhere);
+    if(realKids.length===1 && realKids[0].type==='person'){
+      // With just one child, center directly under THAT child's own card —
+      // not under their whole row's midpoint, which drifts toward whichever
+      // spouse they married and crowds that spouse's own parents (attached
+      // the same way, under their own specific card) right on top of us.
+      node.x = primaryCardCx(realKids[0]);
+    } else if(realKids.length){
+      const first = realKids[0], last = realKids[realKids.length-1];
+      node.x = (primaryCardCx(first) + primaryCardCx(last))/2;
+    } else {
+      node.x = xStart + node.width/2;
+    }
   } else {
     node.x = xStart + node.width/2;
   }
   out.push(node);
 
-  // place this row's downward parent-block(s) — the primary's parents and/or
-  // any spouse's parents — centered as a group below this row
+  // place this row's downward parent-block(s) — each one centered under its
+  // OWNING member's actual card position (not the row's overall midpoint), so
+  // "whose parents are these" stays visually obvious: the primary's parents
+  // land under the primary, a spouse's parents land under that spouse. If two
+  // blocks would collide (common when the row's own cards sit close together
+  // but each block is a full 2-card-wide couple), the later one slides right
+  // just enough to clear the previous one, rather than snapping back to a
+  // shared center.
   if(node.parentBlocks && node.parentBlocks.length){
-    let downWidthTotal = 0;
-    node.parentBlocks.forEach((pb,i)=>{ downWidthTotal += pb.width; if(i>0) downWidthTotal += SIBLING_GAP; });
-    let dcursor = node.x - downWidthTotal/2;
-    node.parentBlocks.forEach(pb=>{
-      placeNode(pb, dcursor, level-1, out);
-      dcursor += pb.width + SIBLING_GAP;
+    const rowW = ownRowWidth(node.id);
+    const memberIds = [node.id, ...personSpouses(node.id).map(s=>s.personId)];
+    const memberCx = {};
+    let mcursor = node.x - rowW/2 + CARD_W/2;
+    memberIds.forEach(mid=>{ memberCx[mid] = mcursor; mcursor += CARD_W + CARD_GAP; });
+
+    const blocks = node.parentBlocks.slice().sort((a,b)=> memberCx[a.ownerMemberId] - memberCx[b.ownerMemberId]);
+    let cursor = -Infinity;
+    blocks.forEach(pb=>{
+      let desiredLeft = memberCx[pb.ownerMemberId] - pb.width/2;
+      if(desiredLeft < cursor) desiredLeft = cursor;
+      placeNode(pb, desiredLeft, level-1, out);
+      cursor = desiredLeft + pb.width + SIBLING_GAP;
     });
   }
 }
@@ -681,7 +728,57 @@ function buildLayout(){
       // nothing extra to do here, kept only as a structural safety net
     }
   });
+  resolveOverlaps(allNodes);
   return {nodes: allNodes};
+}
+
+// The recursive up/down placement is computed independently along each path
+// (a root's own upward cascade vs. a separately-attached parentBlock further
+// down the recursion), so on some family shapes — e.g. the very person chosen
+// as the entry point also turning out to be somebody's in-law with siblings —
+// two branches that were never compared against each other directly can still
+// land at the same level with overlapping X ranges. Rather than try to predict
+// every such shape up front, this final pass just finds any remaining
+// same-level overlaps and nudges the later one (and everything attached to it)
+// clear.
+function shiftSubtree(node, delta){
+  node.x += delta;
+  (node.childNodes||[]).forEach(cn=> shiftSubtree(cn, delta));
+  (node.parentBlocks||[]).forEach(pb=> shiftSubtree(pb, delta));
+}
+function resolveOverlaps(allNodes){
+  const byLevel = {};
+  allNodes.forEach(n=>{
+    if(n.alreadyPlacedElsewhere) return;
+    (byLevel[n.level] = byLevel[n.level] || []).push(n);
+  });
+  Object.values(byLevel).forEach(levelNodes=>{
+    levelNodes.sort((a,b)=>a.x-b.x);
+    for(let i=1;i<levelNodes.length;i++){
+      const prev = levelNodes[i-1], cur = levelNodes[i];
+      const prevHalf = (prev.type==='person' ? ownRowWidth(prev.id) : CARD_W)/2;
+      const curHalf = (cur.type==='person' ? ownRowWidth(cur.id) : CARD_W)/2;
+      const minGap = prevHalf + curHalf + SIBLING_GAP;
+      const gap = cur.x - prev.x;
+      if(gap < minGap){
+        const needed = minGap - gap;
+        // A node can be reachable two different ways at once — e.g. as the
+        // main line's own root AND, via that root's child's spouse, as an
+        // in-law's parentBlock several steps later. Shifting "cur" the usual
+        // way would cascade through its children and could drag the very
+        // node we're trying to separate from right along with it (both move
+        // by the same delta, so the gap never actually changes). A parentBlock
+        // has no such entanglement — it only reaches further backward into
+        // its own ancestors — so when one side of the collision is a
+        // parentBlock, move that one instead, regardless of sort order.
+        if(prev.isParentBlock && !cur.isParentBlock){
+          shiftSubtree(prev, -needed);
+        } else {
+          shiftSubtree(cur, needed);
+        }
+      }
+    }
+  });
 }
 
 /* =========================================================
@@ -796,8 +893,9 @@ function render(){
       memberCx += CARD_W + CARD_GAP;
     });
 
-    if(node.childNodes && node.childNodes.length){
-      const childTops = node.childNodes.map(cn=>({x:cn.x, y:yFor(cn.level)}));
+    const realChildren = (node.childNodes||[]).filter(cn=>!cn.alreadyPlacedElsewhere);
+    if(realChildren.length){
+      const childTops = realChildren.map(cn=>({x:primaryCardCx(cn), y:yFor(cn.level)}));
       const actualBarY = topY - 30;
       svg.appendChild(el('path', {d:`M ${node.x} ${topY} L ${node.x} ${actualBarY}`, class:'conn-line'}));
       const xs = childTops.map(c=>c.x);
