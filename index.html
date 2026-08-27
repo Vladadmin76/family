@@ -55,18 +55,20 @@
 
   /* ---------- canvas / scene ---------- */
   #scene-wrap{
-    flex:1;position:relative;overflow:auto;
+    flex:1;position:relative;overflow:hidden;
     background:#e2e4e7;
-    touch-action: pan-x pan-y;
+    touch-action:none;
     padding-bottom:env(safe-area-inset-bottom, 0px);
   }
-  /* NOT flexbox here on purpose — WebKit (Safari/Chrome on iOS) has a long-standing
-     bug where a scrollable flex container can break panning in one axis once content
-     overflows, and it turns out this isn't limited to align-items: even the auto-margin
-     variant we tried could still misbehave once overflow was only partial. Plain block
-     layout with JS-computed margins (recomputed on every zoom/resize) sidesteps the
-     bug family entirely, at the cost of a little JS bookkeeping. */
-  #scene{position:relative;}
+  /* Panning/zooming is done entirely with a CSS transform on #scene (translate +
+     scale), not the browser's native scroll — this is the standard technique used
+     by established pan/zoom libraries (panzoom, svg-pan-zoom, pinchzoom.js). It
+     sidesteps an entire class of bugs we kept hitting with scrollLeft/scrollTop:
+     WebKit's flexbox+overflow interaction bug, iOS toolbar resize timing, and the
+     manual scroll-position math needed to keep a pinch anchored under your fingers.
+     With a transform, "zoom anchored at a point" is one small formula and there is
+     no scrollable area for the browser to fight us over. */
+  #scene{position:absolute; left:0; top:0; transform-origin:0 0; will-change:transform;}
   #cardLayer{position:absolute; left:0; top:0; width:100%; height:100%; pointer-events:none;}
   #cardLayer .person-card{pointer-events:auto;}
   #zoomControls{
@@ -96,7 +98,7 @@
     overflow:visible;
     cursor:pointer;
     user-select:none;
-    touch-action:pan-x pan-y;
+    touch-action:none;
   }
   .person-card .topbar{height:5px;border-radius:10px 10px 0 0;}
   .person-card.male .topbar{background:var(--male-bar);}
@@ -243,8 +245,7 @@
 <body>
 <div id="app">
   <div id="topbar">
-    <h1>Семейное древо</h1>
-    <button class="btn primary" id="btnAddRoot" style="display:none;">Начать</button>
+    <h1>Семейное древо <span id="appVersion" style="font-size:11px;font-weight:400;color:#999;">v0.1</span></h1>
     <div class="spacer"></div>
     <button id="btnSettings" title="Меню">&#9881;</button>
   </div>
@@ -476,21 +477,6 @@ const BASE_Y = 6000;
 // side (sequential, in the order the marriages were added), so someone who married
 // more than once still gets exactly ONE card, not one per marriage. Children from
 // every marriage are combined into a single row above, ordered by age.
-function personLevel(personId, cache){
-  cache = cache||{};
-  if(cache[personId]!=null) return cache[personId];
-  const p = state.people[personId];
-  let lvl = 0;
-  if(p && p.parentUnionId){
-    const pu = state.unions[p.parentUnionId];
-    [pu.partner1Id, pu.partner2Id].forEach(pid=>{
-      if(pid) lvl = Math.max(lvl, personLevel(pid, cache)+1);
-    });
-  }
-  cache[personId] = lvl;
-  return lvl;
-}
-
 function findRootPersons(){
   const compVisited = new Set();
   const roots = [];
@@ -513,7 +499,6 @@ function findRootPersons(){
 
   Object.keys(state.people).forEach(startId=>{
     if(compVisited.has(startId)) return;
-    // BFS the whole connected family (spouses + children + parents, any direction)
     const comp = [];
     const queue = [startId];
     compVisited.add(startId);
@@ -524,14 +509,6 @@ function findRootPersons(){
         if(!compVisited.has(n)){ compVisited.add(n); queue.push(n); }
       });
     }
-    // Prefer a person with NO recorded parents as the entry point — they sit
-    // at the very top of their lineage, so the whole component cascades
-    // downward from them naturally with no "childless root centered under an
-    // inherited width" mismatch. (Any member would technically still work,
-    // since parentBlocks now pull in ancestors from wherever we start — but
-    // starting from a random deep-in-the-tree, childless, spouseless person
-    // makes their own single-card row get centered under a much wider
-    // inherited slot, which can visually land on top of a sibling's card.)
     const noParent = comp.find(id=>!state.people[id].parentUnionId);
     roots.push(noParent || comp[0]);
   });
@@ -589,205 +566,158 @@ function primaryCardCx(node){
   if(node.type==='leaf') return node.x;
   return node.x - ownRowWidth(node.id)/2 + CARD_W/2;
 }
-
-function measureWidth(node){
-  if(placedPersonIds.has(node.id)){
-    // This exact person already has a card placed somewhere else in the tree
-    // (reachable via a different sibling/spouse path — quite common once a
-    // tree has several marriages). Don't build a second copy of them (or, for
-    // a couple, of their whole ancestry) again: leave this reference
-    // zero-width, and the connector pass will draw a line straight to the
-    // ALREADY-placed card instead. This check has to apply to leaf nodes too —
-    // a childless person can just as easily be reachable from two directions
-    // once their OWN parents are looked up from a different in-law's side.
-    node.width = 0;
-    node.alreadyPlacedElsewhere = true;
-    return 0;
-  }
-  if(node.type==='leaf'){
-    placedPersonIds.add(node.id);
-    node.width = LEAF_SLOT;
-    return node.width;
-  }
-  placedPersonIds.add(node.id);
-  // A spouse shown in this same row is just as "placed" as the primary — if we
-  // only marked the primary, a spouse who is independently reachable as
-  // somebody else's child (via their own parentUnionId) would look unplaced
-  // and get built again as a whole second copy of this same couple.
-  personSpouses(node.id).forEach(s=> placedPersonIds.add(s.personId));
-  const own = ownRowWidth(node.id);
-
-  // Always expand this row's own children upward too — even for a "parent
-  // block" reached by descending from a child. This is what discovers that
-  // child's SIBLINGS (everyone else sharing this same parent union), which
-  // would otherwise silently vanish. The placedPersonIds guard above (and the
-  // per-node check at the top of this function) is what stops this from
-  // walking straight back into the descendant we came from and recursing
-  // forever — not disabling the expansion itself.
-  const kids = splitChildren(node.id);
-  node.childNodes = kids;
-  let upWidth = own;
-  if(kids.length){
-    let w = 0;
-    kids.forEach((cn,i)=>{ w += measureWidth(cn); if(i>0) w += SIBLING_GAP; });
-    upWidth = Math.max(w, own);
-  }
-
-  // Every member of this row (the primary person AND each of their spouses) may
-  // have their OWN separate parents — a married-in spouse's ancestry is just as
-  // real as the primary person's, so we build a downward "parent block" for each
-  // distinct parentUnionId found among the row's members, not just the primary's.
-  const members = [node.id, ...personSpouses(node.id).map(s=>s.personId)];
-  const seenParentUnion = new Set();
-  const parentBlocks = [];
-  members.forEach(mid=>{
-    const mp = state.people[mid];
-    if(mp.parentUnionId && !seenParentUnion.has(mp.parentUnionId)){
-      seenParentUnion.add(mp.parentUnionId);
-      const pu = state.unions[mp.parentUnionId];
-      const pnode = {type:'person', id: pu.partner1Id, isParentBlock:true, ownerMemberId: mid};
-      measureWidth(pnode);
-      parentBlocks.push(pnode);
-    }
-  });
-  node.parentBlocks = parentBlocks;
-  let downWidth = 0;
-  parentBlocks.forEach((pb,i)=>{ downWidth += pb.width; if(i>0) downWidth += SIBLING_GAP; });
-
-  node.width = Math.max(upWidth, downWidth, own);
-  return node.width;
+function nodeWidth(node){
+  return node.type==='person' ? ownRowWidth(node.id) : CARD_W;
 }
 
-function placeNode(node, xStart, level, out){
-  if(node.alreadyPlacedElsewhere){ node.x = xStart; node.level = level; return; }
-  node.level = level;
-  if(node.type==='leaf'){
-    node.x = xStart + node.width/2;
-    out.push(node);
-    return;
-  }
-  let cursor = xStart;
-  (node.childNodes||[]).forEach(cn=>{
-    placeNode(cn, cursor, level+1, out);
-    cursor += cn.width + SIBLING_GAP;
-  });
-  if(node.childNodes && node.childNodes.length){
-    const realKids = node.childNodes.filter(cn=>!cn.alreadyPlacedElsewhere);
-    if(realKids.length===1 && realKids[0].type==='person'){
-      // With just one child, center directly under THAT child's own card —
-      // not under their whole row's midpoint, which drifts toward whichever
-      // spouse they married and crowds that spouse's own parents (attached
-      // the same way, under their own specific card) right on top of us.
-      node.x = primaryCardCx(realKids[0]);
-    } else if(realKids.length){
-      const first = realKids[0], last = realKids[realKids.length-1];
-      node.x = (primaryCardCx(first) + primaryCardCx(last))/2;
-    } else {
-      node.x = xStart + node.width/2;
+/* =========================================================
+   LAYOUT, take two.
+   Researched how established tools handle this (Graphviz/dot's layered
+   drawing model, and d3-dag which is built specifically for DAGs like a
+   family graph with two-parent nodes) — they all keep three passes fully
+   separate: (1) assign each node's RANK/level, (2) fix a left-to-right ORDER
+   within each rank, (3) only THEN compute X coordinates from that order.
+   Our previous version computed width and X in the same recursive pass,
+   which is exactly why a shared node (reachable both as someone's own
+   ancestor AND as an in-law's parentBlock) could end up with two competing
+   "ideal" positions that no amount of after-the-fact patching fully untangled.
+   Keeping order and coordinates as separate steps means overlap becomes
+   structurally impossible once the order is fixed — no patching needed.
+   ========================================================= */
+
+// Phase 1: DFS the family graph (identical relationships to before — upward
+// children via splitChildren, downward parentBlocks per member with a
+// recorded parentUnionId, deduplicated via placedPersonIds so a shared node
+// is only ever built once). The only change from before: this pass ONLY
+// decides each node's rank and its left-to-right ORDER within that rank
+// (by simply appending nodes to a per-level list in visiting order) — it
+// does not touch node.x at all.
+function buildTree(){
+  placedPersonIds = new Set();
+  const allNodes = [];
+  const levelOrder = {};
+  let orderCounter = 0;
+
+  function visit(node, level){
+    if(placedPersonIds.has(node.id)){
+      node.alreadyPlacedElsewhere = true;
+      node.level = level;
+      return node;
     }
-  } else {
-    node.x = xStart + node.width/2;
-  }
-  out.push(node);
+    node.level = level;
+    // Assign the visiting order the moment we commit to rendering this node —
+    // BEFORE recursing into anything else. This is what keeps a parentBlock on
+    // the same side as the specific member it belongs to: if the owner sits on
+    // the left of their row, we reach (and number) their parentBlock before we
+    // ever get to a sibling's spouse's parentBlock on the right, so sorting
+    // each level by this number afterward reproduces that same left-to-right
+    // order instead of the incidental order nodes finished recursing in.
+    node.orderKey = orderCounter++;
+    if(node.type==='leaf'){
+      placedPersonIds.add(node.id);
+      (levelOrder[level] = levelOrder[level] || []).push(node);
+      allNodes.push(node);
+      return node;
+    }
+    placedPersonIds.add(node.id);
+    personSpouses(node.id).forEach(s=> placedPersonIds.add(s.personId));
+    (levelOrder[level] = levelOrder[level] || []).push(node);
+    allNodes.push(node);
 
-  // place this row's downward parent-block(s) — each one centered under its
-  // OWNING member's actual card position (not the row's overall midpoint), so
-  // "whose parents are these" stays visually obvious: the primary's parents
-  // land under the primary, a spouse's parents land under that spouse. If two
-  // blocks would collide (common when the row's own cards sit close together
-  // but each block is a full 2-card-wide couple), the later one slides right
-  // just enough to clear the previous one, rather than snapping back to a
-  // shared center.
-  if(node.parentBlocks && node.parentBlocks.length){
-    const rowW = ownRowWidth(node.id);
-    const memberIds = [node.id, ...personSpouses(node.id).map(s=>s.personId)];
-    const memberCx = {};
-    let mcursor = node.x - rowW/2 + CARD_W/2;
-    memberIds.forEach(mid=>{ memberCx[mid] = mcursor; mcursor += CARD_W + CARD_GAP; });
+    const kids = splitChildren(node.id);
+    node.childNodes = kids;
+    kids.forEach(cn=> visit(cn, level+1));
 
-    const blocks = node.parentBlocks.slice().sort((a,b)=> memberCx[a.ownerMemberId] - memberCx[b.ownerMemberId]);
-    let cursor = -Infinity;
-    blocks.forEach(pb=>{
-      let desiredLeft = memberCx[pb.ownerMemberId] - pb.width/2;
-      if(desiredLeft < cursor) desiredLeft = cursor;
-      placeNode(pb, desiredLeft, level-1, out);
-      cursor = desiredLeft + pb.width + SIBLING_GAP;
+    const members = [node.id, ...personSpouses(node.id).map(s=>s.personId)];
+    const seenParentUnion = new Set();
+    const parentBlocks = [];
+    members.forEach(mid=>{
+      const mp = state.people[mid];
+      if(mp.parentUnionId && !seenParentUnion.has(mp.parentUnionId)){
+        seenParentUnion.add(mp.parentUnionId);
+        const pu = state.unions[mp.parentUnionId];
+        const pnode = {type:'person', id: pu.partner1Id, isParentBlock:true, ownerMemberId: mid};
+        visit(pnode, level-1);
+        parentBlocks.push(pnode);
+      }
     });
+    node.parentBlocks = parentBlocks;
+    return node;
   }
+
+  findRootPersons().forEach(rid=> visit({type:'person', id:rid}, 0));
+  Object.values(levelOrder).forEach(list=> list.sort((a,b)=> a.orderKey - b.orderKey));
+  return {allNodes, levelOrder};
+}
+
+// Phase 2: convert each level's fixed order into X coordinates with a single
+// left-to-right sweep. This alone already guarantees zero overlap — nothing
+// downstream can break it, since every later adjustment stays within the
+// gap it establishes here.
+function packLevel(levelNodes){
+  let cursor = 40;
+  levelNodes.forEach(node=>{
+    if(node.alreadyPlacedElsewhere){ node.x = cursor; return; }
+    const w = nodeWidth(node);
+    node.x = cursor + w/2;
+    cursor += w + SIBLING_GAP;
+  });
+}
+
+// Phase 3: nudge each node toward the average position of whatever it's
+// actually connected to (its own children for an ordinary row, or the
+// specific owning card for a parentBlock), but never past the midpoint gap
+// to its already-processed left neighbor in the SAME fixed order — so a
+// node can move to look better aligned, but can never move far enough to
+// re-create an overlap. A few passes let this settle into a good compromise
+// between "no overlap" (guaranteed structurally) and "parents roughly
+// centered over children" (the visual goal).
+function alignLevel(levelNodes, personCardCx){
+  let prevRightEdge = -Infinity;
+  levelNodes.forEach(node=>{
+    if(node.alreadyPlacedElsewhere) return;
+    const w = nodeWidth(node);
+    let ideal = node.x;
+    if(node.isParentBlock){
+      const ownerX = personCardCx(node.ownerMemberId);
+      if(ownerX != null) ideal = ownerX;
+    } else if(node.childNodes && node.childNodes.length){
+      const pts = node.childNodes.filter(c=>!c.alreadyPlacedElsewhere).map(c=>primaryCardCx(c));
+      if(pts.length) ideal = pts.reduce((a,b)=>a+b,0)/pts.length;
+    }
+    const minX = prevRightEdge===-Infinity ? -Infinity : prevRightEdge + SIBLING_GAP + w/2;
+    node.x = Math.max(ideal, minX);
+    prevRightEdge = node.x + w/2;
+  });
 }
 
 function buildLayout(){
-  placedPersonIds = new Set();
-  const roots = findRootPersons();
-  const allNodes = [];
-  let xOffset = 40;
-  roots.forEach(rootPersonId=>{
-    const rootNode = {type:'person', id: rootPersonId};
-    const w = measureWidth(rootNode);
-    placeNode(rootNode, xOffset, 0, allNodes);
-    xOffset += w + 80;
-  });
-  // isolated persons with no union and no parents at all (edge case after merges)
-  Object.values(state.people).forEach(p=>{
-    if(p.isUnknown) return;
-    const inAnyUnionAsPartner = p.spouseUnionIds && p.spouseUnionIds.length>0;
-    const isChildSomewhere = p.parentUnionId != null;
-    if(!inAnyUnionAsPartner && !isChildSomewhere){
-      // already covered by findRootPersons (they'd be a root with no spouses) —
-      // nothing extra to do here, kept only as a structural safety net
-    }
-  });
-  resolveOverlaps(allNodes);
-  return {nodes: allNodes};
-}
+  const {allNodes, levelOrder} = buildTree();
 
-// The recursive up/down placement is computed independently along each path
-// (a root's own upward cascade vs. a separately-attached parentBlock further
-// down the recursion), so on some family shapes — e.g. the very person chosen
-// as the entry point also turning out to be somebody's in-law with siblings —
-// two branches that were never compared against each other directly can still
-// land at the same level with overlapping X ranges. Rather than try to predict
-// every such shape up front, this final pass just finds any remaining
-// same-level overlaps and nudges the later one (and everything attached to it)
-// clear.
-function shiftSubtree(node, delta){
-  node.x += delta;
-  (node.childNodes||[]).forEach(cn=> shiftSubtree(cn, delta));
-  (node.parentBlocks||[]).forEach(pb=> shiftSubtree(pb, delta));
-}
-function resolveOverlaps(allNodes){
-  const byLevel = {};
+  // a lookup from ANY person's id (primary or spouse) to the row-node that
+  // displays their card, needed to find a parentBlock owner's exact position
+  const nodeByAnyPersonId = {};
   allNodes.forEach(n=>{
-    if(n.alreadyPlacedElsewhere) return;
-    (byLevel[n.level] = byLevel[n.level] || []).push(n);
+    if(n.type!=='person') return;
+    nodeByAnyPersonId[n.id] = n;
+    personSpouses(n.id).forEach(s=> nodeByAnyPersonId[s.personId] = n);
   });
-  Object.values(byLevel).forEach(levelNodes=>{
-    levelNodes.sort((a,b)=>a.x-b.x);
-    for(let i=1;i<levelNodes.length;i++){
-      const prev = levelNodes[i-1], cur = levelNodes[i];
-      const prevHalf = (prev.type==='person' ? ownRowWidth(prev.id) : CARD_W)/2;
-      const curHalf = (cur.type==='person' ? ownRowWidth(cur.id) : CARD_W)/2;
-      const minGap = prevHalf + curHalf + SIBLING_GAP;
-      const gap = cur.x - prev.x;
-      if(gap < minGap){
-        const needed = minGap - gap;
-        // A node can be reachable two different ways at once — e.g. as the
-        // main line's own root AND, via that root's child's spouse, as an
-        // in-law's parentBlock several steps later. Shifting "cur" the usual
-        // way would cascade through its children and could drag the very
-        // node we're trying to separate from right along with it (both move
-        // by the same delta, so the gap never actually changes). A parentBlock
-        // has no such entanglement — it only reaches further backward into
-        // its own ancestors — so when one side of the collision is a
-        // parentBlock, move that one instead, regardless of sort order.
-        if(prev.isParentBlock && !cur.isParentBlock){
-          shiftSubtree(prev, -needed);
-        } else {
-          shiftSubtree(cur, needed);
-        }
-      }
-    }
-  });
+  function personCardCx(personId){
+    const node = nodeByAnyPersonId[personId];
+    if(!node) return null;
+    const rowW = ownRowWidth(node.id);
+    const members = [node.id, ...personSpouses(node.id).map(s=>s.personId)];
+    const idx = members.indexOf(personId);
+    if(idx<0) return null;
+    return node.x - rowW/2 + CARD_W/2 + idx*(CARD_W+CARD_GAP);
+  }
+
+  Object.values(levelOrder).forEach(packLevel);
+  for(let iter=0; iter<6; iter++){
+    Object.values(levelOrder).forEach(levelNodes=> alignLevel(levelNodes, personCardCx));
+  }
+
+  return {nodes: allNodes};
 }
 
 /* =========================================================
@@ -798,7 +728,6 @@ const sceneWrap = document.getElementById('scene-wrap');
 const scene = document.getElementById('scene');
 const cardLayer = document.getElementById('cardLayer');
 const emptyHint = document.getElementById('emptyHint');
-const btnAddRootTop = document.getElementById('btnAddRoot');
 
 function yFor(level){ return BASE_Y - level*LEVEL_HEIGHT; } // bottom edge (baseline) of the card row at this level
 
@@ -834,15 +763,15 @@ function cardHtml(p){
 function render(){
   saveLocal();
   emptyHint.style.display = hasAnyPeople() ? 'none' : 'flex';
-  btnAddRootTop.style.display = hasAnyPeople() ? 'none' : 'inline-block';
   svg.innerHTML = '';
   cardLayer.innerHTML = '';
   cardNodes = [];
   if(!hasAnyPeople()){
+    baseSvgWidth = 0; baseSvgHeight = 0;
     svg.setAttribute('width', 10);
     svg.setAttribute('height', 10);
-    cardLayer.style.width = '10px';
-    cardLayer.style.height = '10px';
+    scene.style.width = '10px';
+    scene.style.height = '10px';
     return;
   }
   const layout = buildLayout();
@@ -869,6 +798,11 @@ function render(){
   baseSvgWidth = svgWidth; baseSvgHeight = svgHeight;
   baseMinX = minX; baseMinY = minY;
   svg.setAttribute('viewBox', `${minX} ${minY} ${svgWidth} ${svgHeight}`);
+  // width/height match the viewBox 1:1 (no attribute-based scaling anymore —
+  // the camera's CSS transform on #scene handles all zooming uniformly for
+  // both the SVG lines and the HTML card layer together)
+  svg.setAttribute('width', svgWidth);
+  svg.setAttribute('height', svgHeight);
 
   const nodeByPersonId = {};
   layout.nodes.forEach(n=>{ if(n.type==='person') nodeByPersonId[n.id] = n; });
@@ -966,7 +900,8 @@ function render(){
     }
   });
 
-  applyZoom();
+  positionCards();
+  applyCamera();
 }
 
 /* =========================================================
@@ -1569,7 +1504,6 @@ function openCreateRootModal(){
 }
 
 document.getElementById('btnStart').onclick = openCreateRootModal;
-document.getElementById('btnAddRoot').onclick = openCreateRootModal;
 
 /* =========================================================
    EXPORT / IMPORT / MERGE
@@ -1741,7 +1675,15 @@ function mergeImported(importedState){
       idMap[ip.id] = existingId;
       merged++;
     } else {
-      const np = newPerson(Object.assign({}, ip, {id:undefined, parentUnionId:null, spouseUnionIds:[], memories:(ip.memories||[]).slice()}));
+      // NOTE: must not pass `id:undefined` here — Object.assign copies that as
+      // an explicit own property (even though its value is undefined),
+      // clobbering newPerson's own generated id, so every merged-in new
+      // person previously ended up sharing the literal key `undefined` in
+      // state.people and overwriting one another. Stripping the field
+      // entirely (rather than nulling it) lets newPerson's own uid() apply.
+      const importedFields = Object.assign({}, ip);
+      delete importedFields.id;
+      const np = newPerson(Object.assign(importedFields, {parentUnionId:null, spouseUnionIds:[], memories:(ip.memories||[]).slice()}));
       idMap[ip.id] = np.id;
       added++;
     }
@@ -1795,113 +1737,161 @@ function mergeImported(importedState){
 }
 
 /* =========================================================
-   ZOOM (pinch-to-zoom + buttons + trackpad ctrl-wheel)
+   CAMERA (pan + zoom via CSS transform — the standard technique used by
+   established libraries like panzoom/svg-pan-zoom/pinchzoom.js, instead of
+   fighting the browser's native scroll model). #scene never moves via
+   scrollLeft/scrollTop; it only ever gets `translate(x,y) scale(s)`. Card
+   positions are set ONCE per render() in the tree's own base (unscaled)
+   coordinate space and never touched again — the camera transform scales
+   everything (SVG lines + HTML cards) uniformly in one step.
    ========================================================= */
-let zoomScale = 1;
+let camera = { x: 0, y: 0, scale: 1 };
 const ZOOM_MIN = 0.12, ZOOM_MAX = 3;
 
-function applyZoom(){
-  if(!baseSvgWidth || !baseSvgHeight) return;
-  svg.setAttribute('width', baseSvgWidth*zoomScale);
-  svg.setAttribute('height', baseSvgHeight*zoomScale);
-  const availW = sceneWrap.clientWidth, availH = sceneWrap.clientHeight;
-  const scaledW = baseSvgWidth*zoomScale, scaledH = baseSvgHeight*zoomScale;
-  scene.style.marginLeft = scaledW < availW ? `${(availW-scaledW)/2}px` : '0px';
-  scene.style.marginTop = scaledH < availH ? `${availH-scaledH}px` : '0px';
-  positionCards();
+function applyCamera(){
+  scene.style.transform = `translate(${camera.x}px, ${camera.y}px) scale(${camera.scale})`;
 }
 
-// Cards are plain HTML elements (not SVG foreignObject — WebKit/iOS has long-
-// standing bugs where foreignObject content silently fails to paint). Each
-// card is scaled individually via a CSS transform anchored at its own
-// top-left corner, so it lines up exactly with the SVG lines beneath it at
-// any zoom level without distorting the scrollable area.
+// Changes scale while keeping the content under (screenX, screenY) fixed on
+// screen. With a transform this is one small formula — no scroll-position
+// bookkeeping, no waiting on layout to catch up with a resize.
+function zoomAt(newScale, screenX, screenY){
+  newScale = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, newScale));
+  const rect = sceneWrap.getBoundingClientRect();
+  const localX = screenX - rect.left, localY = screenY - rect.top;
+  const ratio = newScale / camera.scale;
+  camera.x = localX - (localX - camera.x) * ratio;
+  camera.y = localY - (localY - camera.y) * ratio;
+  camera.scale = newScale;
+  applyCamera();
+}
+
 function positionCards(){
+  if(!baseSvgWidth || !baseSvgHeight) return;
+  scene.style.width = baseSvgWidth + 'px';
+  scene.style.height = baseSvgHeight + 'px';
   cardNodes.forEach(cn=>{
-    const left = (cn.svgX - baseMinX) * zoomScale;
-    const top = (cn.svgY - baseMinY) * zoomScale;
-    cn.div.style.left = left + 'px';
-    cn.div.style.top = top + 'px';
+    cn.div.style.left = (cn.svgX - baseMinX) + 'px';
+    cn.div.style.top = (cn.svgY - baseMinY) + 'px';
     cn.div.style.width = CARD_W + 'px';
     cn.div.style.height = CARD_H + 'px';
-    cn.div.style.transform = `scale(${zoomScale})`;
-    cn.div.style.transformOrigin = '0 0';
   });
 }
 
-function dist(t0, t1){
-  const dx = t0.clientX - t1.clientX, dy = t0.clientY - t1.clientY;
+function dist(a, b){
+  const dx = a.x - b.x, dy = a.y - b.y;
   return Math.sqrt(dx*dx + dy*dy);
 }
 
-// Changes zoomScale while keeping the content under (screenX, screenY) fixed on
-// screen — without this, zooming re-centers on the content's top-left corner and
-// the spot you actually pinched on drifts away, which is very disorienting on a
-// tree with many cards.
-function zoomAt(newScale, screenX, screenY){
-  newScale = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, newScale));
-  if(newScale === zoomScale) return;
-  const rect = sceneWrap.getBoundingClientRect();
-  const localX = screenX - rect.left, localY = screenY - rect.top;
-  const oldMarginLeft = parseFloat(scene.style.marginLeft) || 0;
-  const oldMarginTop = parseFloat(scene.style.marginTop) || 0;
-  const contentX = sceneWrap.scrollLeft + localX - oldMarginLeft;
-  const contentY = sceneWrap.scrollTop + localY - oldMarginTop;
-  const ratio = newScale / zoomScale;
+// One unified pointer-event pipeline handles mouse, touch and pen alike —
+// this is what modern pan/zoom libraries (panzoom, etc.) use instead of
+// separate touchstart/mousedown handlers, since it avoids duplicated/
+// conflicting logic between input types.
+const activePointers = new Map(); // pointerId -> {x, y}
+let dragState = null;      // single-pointer pan: {id, startX, startY, startCamX, startCamY, moved}
+let pinchState = null;     // two-pointer pinch: {startDist, startScale}
+let suppressNextClick = false;
+const DRAG_THRESHOLD = 6; // px of movement before a touch/click counts as a drag, not a tap
 
-  zoomScale = newScale;
-  applyZoom();
-
-  const newMarginLeft = parseFloat(scene.style.marginLeft) || 0;
-  const newMarginTop = parseFloat(scene.style.marginTop) || 0;
-  const targetScrollLeft = contentX*ratio + newMarginLeft - localX;
-  const targetScrollTop = contentY*ratio + newMarginTop - localY;
-  sceneWrap.scrollLeft = targetScrollLeft;
-  sceneWrap.scrollTop = targetScrollTop;
-  // some browsers clamp an immediate scroll assignment to the pre-resize bounds
-  // when it's set in the same tick as the size change; re-applying on the next
-  // animation frame guarantees it actually sticks once layout has caught up
-  requestAnimationFrame(()=>{
-    sceneWrap.scrollLeft = targetScrollLeft;
-    sceneWrap.scrollTop = targetScrollTop;
-  });
+function recomputePinchState(){
+  const pts = Array.from(activePointers.values());
+  if(pts.length === 2){
+    pinchState = { startDist: dist(pts[0], pts[1]), startScale: camera.scale };
+  } else {
+    pinchState = null;
+  }
 }
 
-let pinchStartDist = null, pinchStartScale = null;
-sceneWrap.addEventListener('touchstart', (e)=>{
-  if(e.touches.length===2){
-    pinchStartDist = dist(e.touches[0], e.touches[1]);
-    pinchStartScale = zoomScale;
+sceneWrap.addEventListener('pointerdown', (e)=>{
+  activePointers.set(e.pointerId, {x:e.clientX, y:e.clientY});
+  if(activePointers.size === 2){
+    dragState = null;
+    recomputePinchState();
+  } else if(activePointers.size === 1){
+    dragState = {id:e.pointerId, startX:e.clientX, startY:e.clientY, startCamX:camera.x, startCamY:camera.y, moved:false};
   }
-}, {passive:true});
-sceneWrap.addEventListener('touchmove', (e)=>{
-  if(e.touches.length===2 && pinchStartDist){
-    e.preventDefault();
-    const d = dist(e.touches[0], e.touches[1]);
-    const ns = pinchStartScale * (d / pinchStartDist);
-    const midX = (e.touches[0].clientX + e.touches[1].clientX)/2;
-    const midY = (e.touches[0].clientY + e.touches[1].clientY)/2;
-    zoomAt(ns, midX, midY);
-  }
-}, {passive:false});
-sceneWrap.addEventListener('touchend', (e)=>{
-  if(e.touches.length<2){ pinchStartDist=null; pinchStartScale=null; }
+  // Deliberately NOT using setPointerCapture: in Chromium it can redirect the
+  // eventual synthesized `click` to the capturing element instead of whatever
+  // is actually under the pointer, which silently broke every card tap.
+  // Listening on `window` for move/up below gets the same "keep tracking
+  // even if the pointer leaves the container" benefit without that side effect.
 });
+
+window.addEventListener('pointermove', (e)=>{
+  if(!activePointers.has(e.pointerId)) return;
+  activePointers.set(e.pointerId, {x:e.clientX, y:e.clientY});
+
+  if(activePointers.size === 2 && pinchState){
+    const pts = Array.from(activePointers.values());
+    const d = dist(pts[0], pts[1]);
+    const midX = (pts[0].x + pts[1].x)/2, midY = (pts[0].y + pts[1].y)/2;
+    const ns = pinchState.startScale * (d / pinchState.startDist);
+    zoomAt(ns, midX, midY);
+    return;
+  }
+
+  if(dragState && e.pointerId === dragState.id){
+    const dx = e.clientX - dragState.startX, dy = e.clientY - dragState.startY;
+    if(!dragState.moved && Math.hypot(dx,dy) > DRAG_THRESHOLD) dragState.moved = true;
+    if(dragState.moved){
+      camera.x = dragState.startCamX + dx;
+      camera.y = dragState.startCamY + dy;
+      applyCamera();
+    }
+  }
+});
+
+function endPointer(e){
+  if(dragState && e.pointerId === dragState.id){
+    if(dragState.moved){
+      // a drag that just ended shouldn't also register as a tap on whatever
+      // card/button happens to be under the finger when it lifts
+      suppressNextClick = true;
+    }
+    dragState = null;
+  }
+  activePointers.delete(e.pointerId);
+  recomputePinchState();
+  if(activePointers.size === 1){
+    const [id, pt] = Array.from(activePointers.entries())[0];
+    dragState = {id, startX:pt.x, startY:pt.y, startCamX:camera.x, startCamY:camera.y, moved:false};
+  }
+}
+window.addEventListener('pointerup', endPointer);
+sceneWrap.addEventListener('pointercancel', endPointer);
+
+// Runs in the capture phase so it intercepts the click BEFORE it reaches a
+// card's own listener — that's what actually prevents "drag to pan" from
+// also being read as "tap to open".
+document.addEventListener('click', (e)=>{
+  if(suppressNextClick){
+    suppressNextClick = false;
+    e.stopPropagation();
+    e.preventDefault();
+  }
+}, true);
 
 sceneWrap.addEventListener('wheel', (e)=>{
   if(e.ctrlKey || e.metaKey){
     e.preventDefault();
-    zoomAt(zoomScale - e.deltaY*0.01, e.clientX, e.clientY);
+    zoomAt(camera.scale - e.deltaY*0.01, e.clientX, e.clientY);
+  } else {
+    // plain trackpad/wheel scroll pans the camera, same as it would have
+    // scrolled the old native container
+    e.preventDefault();
+    camera.x -= e.deltaX;
+    camera.y -= e.deltaY;
+    applyCamera();
   }
 }, {passive:false});
 
 document.getElementById('zoomIn').onclick = ()=>{
   const rect = sceneWrap.getBoundingClientRect();
-  zoomAt(zoomScale + 0.2, rect.left + rect.width/2, rect.top + rect.height/2);
+  zoomAt(camera.scale + 0.2, rect.left + rect.width/2, rect.top + rect.height/2);
 };
 document.getElementById('zoomOut').onclick = ()=>{
   const rect = sceneWrap.getBoundingClientRect();
-  zoomAt(zoomScale - 0.2, rect.left + rect.width/2, rect.top + rect.height/2);
+  zoomAt(camera.scale - 0.2, rect.left + rect.width/2, rect.top + rect.height/2);
 };
 
 function autoFitZoom(){
@@ -1910,12 +1900,12 @@ function autoFitZoom(){
   const availH = sceneWrap.clientHeight;
   if(!availW || !availH) return;
   const fit = Math.min(availW/baseSvgWidth, availH/baseSvgHeight) * 0.92;
-  zoomScale = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, fit));
-  applyZoom();
-  requestAnimationFrame(()=>{
-    sceneWrap.scrollTop = sceneWrap.scrollHeight;
-    sceneWrap.scrollLeft = (sceneWrap.scrollWidth - sceneWrap.clientWidth)/2;
-  });
+  camera.scale = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, fit));
+  // center horizontally, anchor to the bottom — same visual convention as
+  // before (ancestors sit at the bottom of a mostly-empty screen at first)
+  camera.x = (availW - baseSvgWidth*camera.scale) / 2;
+  camera.y = availH - baseSvgHeight*camera.scale;
+  applyCamera();
 }
 
 /* =========================================================
@@ -2041,7 +2031,6 @@ const hadSavedData = loadLocal();
    INIT
    ========================================================= */
 render();
-applyZoom();
 if(hadSavedData && hasAnyPeople()){
   requestAnimationFrame(()=> requestAnimationFrame(autoFitZoom));
 }
