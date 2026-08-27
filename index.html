@@ -290,6 +290,7 @@ function newPerson(data){
     id: uid('p'),
     firstName:'', lastName:'', middleName:'',
     gender:'', birthDate:'', deathDate:'',
+    isDeceased:false, // explicit status — independent of whether any dates are known
     isUnknown:false,
     photoUrl:null, // reserved for future photo support — not used yet
     parentUnionId:null,
@@ -298,6 +299,12 @@ function newPerson(data){
   }, data);
   state.people[p.id] = p;
   return p;
+}
+// Whether a person is deceased — checks the explicit flag first, but also
+// respects older saved files (or merged-in data) that only ever recorded a
+// deathDate and never had this flag at all.
+function isPersonDeceased(p){
+  return !!(p && (p.isDeceased || p.deathDate));
 }
 function newUnion(partner1Id, partner2Id){
   const u = { id: uid('u'), partner1Id: partner1Id||null, partner2Id: partner2Id||null, childrenIds:[], status:'married' };
@@ -330,7 +337,9 @@ function preciseAge(p){
   if(!p.birthDate) return null;
   const by = new Date(p.birthDate);
   if(isNaN(by)) return null;
-  const endDate = p.deathDate ? new Date(p.deathDate) : new Date();
+  const deceased = isPersonDeceased(p);
+  if(deceased && !p.deathDate) return null; // deceased but no death date on record — can't compute an age
+  const endDate = deceased ? new Date(p.deathDate) : new Date();
   if(isNaN(endDate)) return null;
   let age = endDate.getFullYear() - by.getFullYear();
   const m = endDate.getMonth() - by.getMonth();
@@ -818,7 +827,7 @@ function cardHtml(p){
     <div class="avatar-wrap">${avatarInner}</div>
     <div class="pname">${esc(fullName(p))}</div>
     ${age!=null ? `<div class="page-age">${age}</div>` : ''}
-    ${p.deathDate ? `<div class="ribbon-wrap"></div>` : ''}
+    ${isPersonDeceased(p) ? `<div class="ribbon-wrap"></div>` : ''}
   `;
 }
 
@@ -911,7 +920,7 @@ function render(){
   // elements are the reliable choice here). ----
   function addCard(p, svgX, svgY, extraLabel){
     const div = document.createElement('div');
-    div.className = 'person-card ' + genderClass(p) + (p.deathDate ? ' deceased' : '');
+    div.className = 'person-card ' + genderClass(p) + (isPersonDeceased(p) ? ' deceased' : '');
     div.innerHTML = cardHtml(p);
     div.addEventListener('click', (e)=>{
       if(e.target.closest('.add-btn')) return;
@@ -1065,16 +1074,16 @@ function wireRadioHighlight(container){
 }
 
 function renderMainTab(body, p, justSaved){
-  const isAlive = !p.deathDate;
+  const isAlive = !isPersonDeceased(p);
   const lived = lifespanYears(p);
   let summaryHtml = '';
   if(justSaved){
     summaryHtml += `<div class="life-summary" id="savedFlash" style="background:#e3f6e8;color:#1e7a34;font-weight:600;">Сохранено ✓</div>`;
   }
-  if(!p.isUnknown && p.deathDate && lived!=null){
+  if(!p.isUnknown && !isAlive && lived!=null){
     summaryHtml += `<div class="life-summary">Прожил(а) ${lived} ${pluralYears(lived)}.</div>`;
-  } else if(!p.isUnknown && p.deathDate){
-    summaryHtml += `<div class="life-summary">Умер(ла) — годы жизни не полностью известны.</div>`;
+  } else if(!p.isUnknown && !isAlive){
+    summaryHtml += `<div class="life-summary">Умер(ла) — даты не полностью известны.</div>`;
   }
   body.innerHTML = `
     ${p.isUnknown?'<p class="hint-text">Этот человек пока отмечен как неизвестный (?). Заполните данные, если они найдутся.</p>':''}
@@ -1092,10 +1101,11 @@ function renderMainTab(body, p, justSaved){
         <label class="radio-opt ${isAlive?'checked':''}"><input type="radio" name="f_alive" value="alive" ${isAlive?'checked':''}> Жив(а)</label>
         <label class="radio-opt ${!isAlive?'checked':''}"><input type="radio" name="f_alive" value="dead" ${!isAlive?'checked':''}> Умер(ла)</label>
       </div>
+      <p class="hint-text" style="margin-top:6px;margin-bottom:0;">Дату смерти можно оставить пустой, если она неизвестна — статус «умер(ла)» всё равно сохранится.</p>
     </div>
     <div class="row2">
       <div class="field"><label>Дата рождения</label><input id="f_birth" type="date" value="${esc(p.birthDate)}"></div>
-      <div class="field" id="deathField" style="${isAlive?'display:none;':''}"><label>Дата смерти</label><input id="f_death" type="date" value="${esc(p.deathDate)}"></div>
+      <div class="field" id="deathField" style="${isAlive?'display:none;':''}"><label>Дата смерти (если известна)</label><input id="f_death" type="date" value="${esc(p.deathDate)}"></div>
     </div>
     <button class="btn primary" id="saveMain" style="width:100%;">Сохранить</button>
     <button class="btn danger" id="deleteMainBtn" style="width:100%;margin-top:10px;">Удалить этого человека</button>
@@ -1114,7 +1124,8 @@ function renderMainTab(body, p, justSaved){
     p.gender = genderInput ? genderInput.value : '';
     p.birthDate = body.querySelector('#f_birth').value;
     const aliveInput = body.querySelector('input[name=f_alive]:checked');
-    p.deathDate = (aliveInput && aliveInput.value==='dead') ? body.querySelector('#f_death').value : '';
+    p.isDeceased = !!(aliveInput && aliveInput.value==='dead');
+    p.deathDate = p.isDeceased ? body.querySelector('#f_death').value : '';
     if(p.isUnknown && p.firstName) p.isUnknown = false;
     render();
     renderPersonModal(p.id, true);
@@ -1354,12 +1365,15 @@ function openPersonViewModal(personId){
   const backdrop = document.createElement('div');
   backdrop.className = 'modal-backdrop';
 
-  const lived = p.deathDate ? lifespanYears(p) : null;
+  const deceased = isPersonDeceased(p);
+  const lived = deceased ? lifespanYears(p) : null;
   const age = preciseAge(p);
   let ageLine = '';
-  if(p.deathDate && lived!=null){
+  if(deceased && lived!=null){
     ageLine = `Прожил(а) ${lived} ${pluralYears(lived)}`;
-  } else if(!p.deathDate && age!=null){
+  } else if(deceased){
+    ageLine = `Умер(ла) — даты не полностью известны`;
+  } else if(age!=null){
     ageLine = `Возраст: ${age} ${pluralYears(age)}`;
   }
 
@@ -1720,7 +1734,7 @@ function mergeImported(importedState){
     const existingId = key.replace(/\|+$/,'') && existingByKey[key];
     if(existingId){
       const ex = state.people[existingId];
-      ['lastName','firstName','middleName','gender','birthDate','deathDate'].forEach(f=>{
+      ['lastName','firstName','middleName','gender','birthDate','deathDate','isDeceased'].forEach(f=>{
         if(!ex[f] && ip[f]) ex[f] = ip[f];
       });
       (ip.memories||[]).forEach(m=> ex.memories.push(m));
