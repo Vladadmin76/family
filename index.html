@@ -56,7 +56,7 @@
   /* ---------- canvas / scene ---------- */
   #scene-wrap{
     flex:1;position:relative;overflow:hidden;
-    background:#e2e4e7;
+    background:#1b5e3c;
     touch-action:none;
     padding-bottom:env(safe-area-inset-bottom, 0px);
   }
@@ -256,7 +256,7 @@
 <body>
 <div id="app">
   <div id="topbar">
-    <h1>Семейное древо <span id="appVersion" style="font-size:11px;font-weight:400;color:#999;">v0.9</span></h1>
+    <h1>Семейное древо <span id="appVersion" style="font-size:11px;font-weight:400;color:#999;">v0.11</span></h1>
     <div class="spacer"></div>
     <button id="btnSettings" title="Меню">&#9881;</button>
   </div>
@@ -976,69 +976,93 @@ function render(){
 
   const nodeByPersonId = {};
   layout.nodes.forEach(n=>{ if(n.type==='person') nodeByPersonId[n.id] = n; });
+  // extended so it also resolves a SPOUSE's id back to the row they're shown
+  // in — needed below to find any specific person's own card position,
+  // regardless of whether they're the row's primary or a married-in spouse
+  const rowOfPerson = {};
+  layout.nodes.forEach(n=>{
+    if(n.type!=='person') return;
+    rowOfPerson[n.id] = n;
+    personSpouses(n.id).forEach(s=> rowOfPerson[s.personId] = n);
+  });
+
+  // A person's own specific card center — the ONE stable position every
+  // connector referencing them must use, whether they're a row's primary or
+  // one of its spouses, or a childless leaf shown on their own.
+  function cardCxOf(personId){
+    const node = rowOfPerson[personId];
+    if(node){
+      const rowW = ownRowWidth(node.id);
+      const members = [node.id, ...personSpouses(node.id).map(s=>s.personId)];
+      const idx = members.indexOf(personId);
+      if(idx>=0) return node.x - rowW/2 + CARD_W/2 + idx*(CARD_W+CARD_GAP);
+    }
+    const leafNode = layout.nodes.find(n=>n.type==='leaf' && n.id===personId);
+    return leafNode ? leafNode.x : null;
+  }
+
+  // The ONE anchor point for a marriage/union: the midpoint between its two
+  // partners' own specific card centers. Every connector that touches this
+  // union — a child reaching down to it, EITHER partner's own ancestry
+  // reaching further down from it — always targets this exact same point.
+  // Before this, different parts of the code used different stand-ins for
+  // "where this couple is" (a row's overall center, one specific member's
+  // card, a parent-block's owner) and those disagreed with each other often
+  // enough to leave a visible gap between two line fragments that were
+  // supposed to be one continuous connector.
+  function unionAnchorX(unionId){
+    const u = state.unions[unionId];
+    const ids = [u.partner1Id, u.partner2Id].filter(Boolean);
+    const xs = ids.map(cardCxOf).filter(x=>x!=null);
+    if(!xs.length) return null;
+    return xs.reduce((a,b)=>a+b,0)/xs.length;
+  }
+
+  // Each couple's connector lines get their own stable color, so two
+  // unrelated lines that happen to run through the same stretch of screen —
+  // because one couple's card physically sits right where a completely
+  // different couple's line bends on its way further up — read as visibly
+  // different lines instead of looking like one continuous connector that
+  // happens to "pass through" a card. The order is keyed off each union's
+  // own id (stable however the tree is built or re-rendered), not creation
+  // order or position, so the same couple always keeps the same color.
+  const LINE_COLORS = ['#ffb142','#48dbfb','#ff6b81','#a29bfe','#f8a5c2','#54a0ff','#ff7f50','#c8d6e5','#786fa6','#ee5253'];
+  const sortedUnionIds = Object.keys(state.unions).sort();
+  function unionColor(unionId){
+    const idx = sortedUnionIds.indexOf(unionId);
+    return LINE_COLORS[idx % LINE_COLORS.length];
+  }
 
   // ---- connector lines ----
+  // Every person who has a recorded parentUnionId draws exactly ONE
+  // independent line, straight from their own card down to their parents'
+  // union anchor — full stop. No shared "bus bar" that has to be stretched
+  // to cover every sibling AND the parents' own stem, no separate rule for
+  // a spouse vs. the row's primary, no special case for a person who was
+  // discovered as someone else's parentBlock rather than as a normal
+  // upward child. All of those used to be different code paths with
+  // different reference points, which is exactly what kept producing
+  // mismatched, disconnected line fragments. One rule, applied to every
+  // person the same way, can't disagree with itself.
   layout.nodes.forEach(node=>{
-    if(node.type!=='person') return;
+    if(node.alreadyPlacedElsewhere) return;
     const bottomY = yFor(node.level);
-    const topY = bottomY - CARD_H;
-
-    // A down-connector for each SPOUSE in this row who has parents — a
-    // married-in spouse's ancestry (a parentBlock) isn't reachable any other
-    // way. The PRIMARY's own parent connection is normally skipped here: it's
-    // already drawn once, from the parent's own "up to children" bar below —
-    // drawing it again as well (with a different bend height) produces two
-    // slightly different lines between the same two cards.
-    //
-    // EXCEPT when this row is ITSELF a parentBlock (isParentBlock): then the
-    // primary's own parent was reached by a completely different route — as
-    // THEIR own ownerMemberId attachment, discovered while building THIS
-    // row — not via the normal "someone's actual child" upward expansion.
-    // That parent's row does still try to rediscover this primary as one of
-    // its own real children (everything always expands upward too), but
-    // finds them already claimed and gets back an empty ghost reference — so
-    // its "up to children" bar never reaches this primary at all. Only THIS
-    // primary's own down-connector can draw that link, so it can't be
-    // skipped here the way a normal primary's can.
-    const rowW = ownRowWidth(node.id);
-    const rowMembers = [node.id, ...personSpouses(node.id).map(s=>s.personId)];
-    let memberCx = node.x - rowW/2 + CARD_W/2;
-    rowMembers.forEach((mid, memberIdx)=>{
+    const members = node.type==='leaf' ? [node.id] : [node.id, ...personSpouses(node.id).map(s=>s.personId)];
+    members.forEach(mid=>{
       const mp = state.people[mid];
-      if((memberIdx>0 || node.isParentBlock) && mp.parentUnionId){
-        const pu = state.unions[mp.parentUnionId];
-        const parentIds = [pu.partner1Id, pu.partner2Id].filter(Boolean);
-        const parentNode = parentIds.map(pid=>nodeByPersonId[pid]).find(Boolean);
-        if(parentNode){
-          const px = parentNode.x;
-          const py = yFor(parentNode.level);
-          const barY = (bottomY + py)/2;
-          svg.appendChild(el('path', {d:`M ${memberCx} ${bottomY} L ${memberCx} ${barY} L ${px} ${barY} L ${px} ${py-CARD_H}`, class:'conn-line'}));
-        }
-      }
-      memberCx += CARD_W + CARD_GAP;
+      if(!mp.parentUnionId) return;
+      const pu = state.unions[mp.parentUnionId];
+      const parentIds = [pu.partner1Id, pu.partner2Id].filter(Boolean);
+      const parentNode = parentIds.map(pid=>nodeByPersonId[pid]).find(Boolean);
+      if(!parentNode) return;
+      const childX = node.type==='leaf' ? node.x : cardCxOf(mid);
+      const anchorX = unionAnchorX(mp.parentUnionId);
+      if(childX==null || anchorX==null) return;
+      const py = yFor(parentNode.level);
+      const barY = (bottomY + py)/2;
+      const color = unionColor(mp.parentUnionId);
+      svg.appendChild(el('path', {d:`M ${childX} ${bottomY} L ${childX} ${barY} L ${anchorX} ${barY} L ${anchorX} ${py-CARD_H}`, class:'conn-line', style:`stroke:${color}`}));
     });
-
-    const realChildren = (node.childNodes||[]).filter(cn=>!cn.alreadyPlacedElsewhere);
-    if(realChildren.length){
-      const childTops = realChildren.map(cn=>({x:primaryCardCx(cn), y:yFor(cn.level)}));
-      const actualBarY = topY - 30;
-      const stemX = primaryCardCx(node);
-      svg.appendChild(el('path', {d:`M ${stemX} ${topY} L ${stemX} ${actualBarY}`, class:'conn-line'}));
-      // The horizontal bar must span from the PARENT's own stem position too,
-      // not just between the children — when a row has only one real child
-      // (the common case once the others turn out to be ghosts, married
-      // elsewhere), the children-only span collapses to a single point that
-      // can sit nowhere near the parent's own stem (e.g. their row is wide
-      // because of a second spouse), leaving two disconnected line
-      // fragments instead of one continuous path. This is the root cause
-      // behind every "hanging stub" report so far.
-      const xs = childTops.map(c=>c.x).concat([stemX]);
-      svg.appendChild(el('path', {d:`M ${Math.min(...xs)} ${actualBarY} L ${Math.max(...xs)} ${actualBarY}`, class:'conn-line'}));
-      childTops.forEach(c=>{
-        svg.appendChild(el('path', {d:`M ${c.x} ${actualBarY} L ${c.x} ${c.y}`, class:'conn-line'}));
-      });
-    }
   });
 
   // ---- cards: plain HTML divs in #cardLayer (WebKit/iOS has long-standing
