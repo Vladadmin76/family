@@ -98,7 +98,18 @@
     overflow:visible;
     cursor:pointer;
     user-select:none;
+    -webkit-user-select:none;
+    /* iOS Safari's text-selection callout (Copy/Look Up/Translate/Share) is
+       a SEPARATE mechanism from user-select — it fires on any sustained
+       press-and-hold regardless of user-select:none, which is exactly what
+       our long-press-to-select gesture triggers unless this is set too. */
+    -webkit-touch-callout:none;
     touch-action:none;
+  }
+  .person-card.rel-selected{
+    outline:3px solid #f5c518;
+    outline-offset:2px;
+    box-shadow:0 2px 10px rgba(245,197,24,0.5);
   }
   .person-card .topbar{height:5px;border-radius:10px 10px 0 0;}
   .person-card.male .topbar{background:var(--male-bar);}
@@ -245,7 +256,7 @@
 <body>
 <div id="app">
   <div id="topbar">
-    <h1>Семейное древо <span id="appVersion" style="font-size:11px;font-weight:400;color:#999;">v0.1</span></h1>
+    <h1>Семейное древо <span id="appVersion" style="font-size:11px;font-weight:400;color:#999;">v0.3</span></h1>
     <div class="spacer"></div>
     <button id="btnSettings" title="Меню">&#9881;</button>
   </div>
@@ -854,10 +865,45 @@ function render(){
   // elements are the reliable choice here). ----
   function addCard(p, svgX, svgY, extraLabel){
     const div = document.createElement('div');
-    div.className = 'person-card ' + genderClass(p) + (isPersonDeceased(p) ? ' deceased' : '');
+    div.className = 'person-card ' + genderClass(p) + (isPersonDeceased(p) ? ' deceased' : '') + (relationshipSelection===p.id ? ' rel-selected' : '');
     div.innerHTML = cardHtml(p);
+
+    // Long-press to pick this card for the relationship finder — a short
+    // press still opens the profile as usual; only a sustained press (with
+    // no drag in progress) counts as "select this one".
+    let longPressTimer = null, longPressFired = false;
+    div.addEventListener('pointerdown', (e)=>{
+      if(e.target.closest('.add-btn')) return;
+      longPressFired = false;
+      longPressTimer = setTimeout(()=>{
+        longPressFired = true;
+        suppressNextClick = true;
+        // Safety net: some browsers never synthesize a 'click' after a long
+        // enough press-and-hold, which would leave suppressNextClick stuck at
+        // true forever — silently swallowing the very next, unrelated tap
+        // anywhere in the app. Self-resetting shortly after guards against
+        // that regardless of whether a click actually follows.
+        setTimeout(()=>{ suppressNextClick = false; }, 400);
+        selectForRelationship(p.id);
+      }, 550);
+    });
+    div.addEventListener('pointermove', ()=>{
+      if(longPressTimer && dragState && dragState.moved){
+        clearTimeout(longPressTimer); longPressTimer = null;
+      }
+    });
+    ['pointerup','pointercancel'].forEach(evt=> div.addEventListener(evt, ()=>{
+      if(longPressTimer){ clearTimeout(longPressTimer); longPressTimer = null; }
+    }));
+
     div.addEventListener('click', (e)=>{
       if(e.target.closest('.add-btn')) return;
+      if(longPressFired){ longPressFired = false; return; }
+      if(relationshipSelection){
+        if(relationshipSelection === p.id) clearRelationshipSelection();
+        else showRelationshipResult(relationshipSelection, p.id);
+        return;
+      }
       if(p.isUnknown){
         openPersonModal(p.id, 'main');
       } else {
@@ -866,6 +912,7 @@ function render(){
     });
     div.querySelector('.add-btn').addEventListener('click', (e)=>{
       e.stopPropagation();
+      if(relationshipSelection) return;
       openAddPopover(p.id, e.clientX, e.clientY);
     });
     if(extraLabel){
@@ -1735,6 +1782,276 @@ function mergeImported(importedState){
 
   return {merged, added};
 }
+
+/* =========================================================
+   RELATIONSHIP (родство) — standard "common ancestor" method used by
+   genealogy calculators and (going back centuries) church canon-law tables:
+   find the nearest shared ancestor, count generations up from each person to
+   them, and look up the term for that (up, down) pair. Marriage-based
+   (свойство) terms are checked separately when there's no blood link.
+   ========================================================= */
+
+// personId -> shortest number of parent-steps up to reach them (0 = self)
+function getAncestorsWithDistance(personId){
+  const dist = {};
+  const queue = [[personId, 0]];
+  while(queue.length){
+    const [pid, d] = queue.shift();
+    if(dist[pid] !== undefined && dist[pid] <= d) continue;
+    dist[pid] = d;
+    const p = state.people[pid];
+    if(p && p.parentUnionId){
+      const pu = state.unions[p.parentUnionId];
+      [pu.partner1Id, pu.partner2Id].forEach(parentId=>{
+        if(parentId) queue.push([parentId, d+1]);
+      });
+    }
+  }
+  return dist;
+}
+
+// All nearest common ancestors (there can be two — both parents of a full
+// sibling pair — which is exactly how we tell "родной" from "сводный" below).
+function findCommonAncestors(idA, idB){
+  const ancA = getAncestorsWithDistance(idA);
+  const ancB = getAncestorsWithDistance(idB);
+  const common = [];
+  Object.keys(ancA).forEach(pid=>{
+    if(ancB[pid] !== undefined) common.push({id:pid, distA:ancA[pid], distB:ancB[pid]});
+  });
+  if(!common.length) return null;
+  const minTotal = Math.min(...common.map(c=>c.distA+c.distB));
+  return common.filter(c=>c.distA+c.distB===minTotal);
+}
+
+function cousinPrefix(degree){
+  const names = {1:'двоюродн',2:'троюродн',3:'четвероюродн',4:'пятиюродн',5:'шестиюродн',6:'семиюродн',7:'восьмиюродн',8:'девятиюродн'};
+  return names[degree] || null;
+}
+
+// self is `distOther` generations ABOVE other (other descends from self)
+function ancestorTerm(distOther, genderSelf){
+  if(distOther===1) return genderSelf==='f' ? 'мать' : 'отец';
+  const pras = 'пра'.repeat(distOther-2);
+  return pras + (genderSelf==='f' ? 'бабушка' : 'дедушка');
+}
+// self is `distSelf` generations BELOW other (self descends from other)
+function descendantTerm(distSelf, genderSelf){
+  if(distSelf===1) return genderSelf==='f' ? 'дочь' : 'сын';
+  const pras = 'пра'.repeat(distSelf-2);
+  return pras + (genderSelf==='f' ? 'внучка' : 'внук');
+}
+
+// The term for "self" (at distSelf generations from the common ancestor),
+// given the other person is at distOther generations from that same ancestor.
+function bloodTerm(distSelf, distOther, genderSelf, fullSibling){
+  if(distSelf===0 && distOther===0) return null; // same person — handled by the caller
+  if(distSelf===0) return ancestorTerm(distOther, genderSelf);
+  if(distOther===0) return descendantTerm(distSelf, genderSelf);
+  if(distSelf===1 && distOther===1){
+    if(fullSibling) return genderSelf==='f' ? 'родная сестра' : 'родной брат';
+    return genderSelf==='f' ? 'сводная сестра' : 'сводный брат';
+  }
+  const minD = Math.min(distSelf, distOther), diff = distSelf - distOther;
+  if(minD===1 && Math.abs(diff)===1){
+    return diff<0 ? (genderSelf==='f'?'тётя':'дядя') : (genderSelf==='f'?'племянница':'племянник');
+  }
+  if(minD===1 && Math.abs(diff)===2){
+    return diff<0 ? (genderSelf==='f'?'двоюродная бабушка':'двоюродный дед') : (genderSelf==='f'?'внучатая племянница':'внучатый племянник');
+  }
+  if(minD>=2 && diff===0){
+    const prefix = cousinPrefix(minD-1);
+    if(!prefix) return null;
+    return genderSelf==='f' ? prefix+'ая сестра' : prefix+'ый брат';
+  }
+  if(minD>=2 && Math.abs(diff)===1){
+    const prefix = cousinPrefix(minD-1);
+    if(!prefix) return null;
+    return diff<0 ? prefix+(genderSelf==='f'?'ая тётя':'ый дядя') : prefix+(genderSelf==='f'?'ая племянница':'ый племянник');
+  }
+  return null; // too distant / irregular for a single common word
+}
+
+function describeBloodRelationship(idA, idB){
+  if(idA===idB) return null;
+  const common = findCommonAncestors(idA, idB);
+  if(!common) return null;
+  const {distA, distB} = common[0];
+  const fullSibling = distA===1 && distB===1 && common.length>=2;
+  const A = state.people[idA], B = state.people[idB];
+  const labelA = bloodTerm(distA, distB, A.gender, fullSibling);
+  const labelB = bloodTerm(distB, distA, B.gender, fullSibling);
+  if(labelA==null || labelB==null){
+    return {
+      labelA: `дальний родственник (общий предок на ${distA} и ${distB} поколений)`,
+      labelB: `дальний родственник (общий предок на ${distB} и ${distA} поколений)`,
+      generic: true
+    };
+  }
+  return {labelA, labelB, fullSibling};
+}
+
+// свойство — relationships that exist only through a marriage, not blood.
+// Covers the direct, well-established terms; anything more distant than that
+// (e.g. "wife of a third cousin") falls back to a plain composed description
+// rather than guessing at an obscure/inconsistent word.
+function describeMarriageRelationship(idA, idB){
+  const A = state.people[idA], B = state.people[idB];
+  const spousesA = personSpouses(idA).map(s=>s.personId);
+  const spousesB = personSpouses(idB).map(s=>s.personId);
+
+  if(spousesA.includes(idB)){
+    return {
+      labelA: A.gender==='f' ? 'жена' : 'муж',
+      labelB: B.gender==='f' ? 'жена' : 'муж'
+    };
+  }
+
+  // B is a parent of A's spouse (B is A's тесть/тёща/свёкор/свекровь), or
+  // vice versa — check both directions with the same helper.
+  function parentInLaw(fromId, spouseIds, toId){
+    for(const sp of spouseIds){
+      const spPerson = state.people[sp];
+      if(spPerson.parentUnionId){
+        const pu = state.unions[spPerson.parentUnionId];
+        if(pu.partner1Id===toId || pu.partner2Id===toId){
+          const toPerson = state.people[toId];
+          const labelParent = spPerson.gender==='f'
+            ? (toPerson.gender==='f' ? 'тёща' : 'тесть')
+            : (toPerson.gender==='f' ? 'свекровь' : 'свёкор');
+          const fromPerson = state.people[fromId];
+          const labelChild = fromPerson.gender==='f' ? 'невестка' : 'зять';
+          return {labelFrom:labelChild, labelTo:labelParent};
+        }
+      }
+    }
+    return null;
+  }
+  let hit = parentInLaw(idA, spousesA, idB);
+  if(hit) return {labelA:hit.labelFrom, labelB:hit.labelTo};
+  hit = parentInLaw(idB, spousesB, idA);
+  if(hit) return {labelA:hit.labelTo, labelB:hit.labelFrom};
+
+  // B is a sibling of A's spouse (or vice versa) — шурин/свояченица (wife's
+  // side) or деверь/золовка (husband's side); reuses зять/невестка for the
+  // reverse direction, same as real usage.
+  function siblingInLaw(fromId, spouseIds, toId){
+    for(const sp of spouseIds){
+      const spPerson = state.people[sp];
+      const rel = describeBloodRelationship(sp, toId);
+      if(rel && !rel.generic && (rel.labelA==='родной брат' || rel.labelA==='родная сестра' || rel.labelA==='сводный брат' || rel.labelA==='сводная сестра')){
+        const toPerson = state.people[toId];
+        const labelSibling = spPerson.gender==='f'
+          ? (toPerson.gender==='f' ? 'свояченица' : 'шурин')
+          : (toPerson.gender==='f' ? 'золовка' : 'деверь');
+        const fromPerson = state.people[fromId];
+        const labelBack = fromPerson.gender==='f' ? 'невестка' : 'зять';
+        return {labelFrom:labelBack, labelTo:labelSibling};
+      }
+    }
+    return null;
+  }
+  hit = siblingInLaw(idA, spousesA, idB);
+  if(hit) return {labelA:hit.labelFrom, labelB:hit.labelTo};
+  hit = siblingInLaw(idB, spousesB, idA);
+  if(hit) return {labelA:hit.labelTo, labelB:hit.labelFrom};
+
+  // сват/сватья — A's child is married to B's child
+  const childrenA = personChildren(idA), childrenB = personChildren(idB);
+  for(const ca of childrenA){
+    if(personSpouses(ca).some(s=>childrenB.includes(s.personId))){
+      return {
+        labelA: A.gender==='f' ? 'сватья' : 'сват',
+        labelB: B.gender==='f' ? 'сватья' : 'сват'
+      };
+    }
+  }
+
+  // more distant in-law link (e.g. spouse of a cousin) — compose a plain,
+  // ungendered description instead of inventing a term nobody agrees on
+  for(const sp of spousesA){
+    const rel = describeBloodRelationship(sp, idB);
+    if(rel && !rel.generic){
+      return {
+        labelA: (A.gender==='f'?'жена ':'муж ') + 'человека, приходящегося ' + rel.labelB,
+        labelB: rel.labelB + ' супруга(и)'
+      };
+    }
+  }
+  for(const sp of spousesB){
+    const rel = describeBloodRelationship(idA, sp);
+    if(rel && !rel.generic){
+      return {
+        labelA: rel.labelA + ' супруга(и)',
+        labelB: (B.gender==='f'?'жена ':'муж ') + 'человека, приходящегося ' + rel.labelA
+      };
+    }
+  }
+  return null;
+}
+
+function describeRelationship(idA, idB){
+  const blood = describeBloodRelationship(idA, idB);
+  if(blood) return blood;
+  const marriage = describeMarriageRelationship(idA, idB);
+  if(marriage) return marriage;
+  return null;
+}
+
+/* ---------- relationship-finder UI: long-press a card, then tap another ---------- */
+let relationshipSelection = null;
+
+function selectForRelationship(personId){
+  relationshipSelection = personId;
+  render(); // re-render just to apply the highlight class; camera position is untouched
+}
+function clearRelationshipSelection(){
+  if(!relationshipSelection) return;
+  relationshipSelection = null;
+  render();
+}
+
+function relCardHtml(p, label){
+  const cls = genderClass(p);
+  const avatarSrc = p.photoUrl || (cls==='male' ? IMG_AVATAR_MALE : cls==='female' ? IMG_AVATAR_FEMALE : null);
+  const avatarInner = avatarSrc
+    ? `<img src="${avatarSrc}" alt="" style="width:100%;height:100%;object-fit:cover;border-radius:50%;">`
+    : `<svg viewBox="0 0 24 24" width="30" height="30" fill="#aab0b6"><circle cx="12" cy="8" r="4"/><path d="M4 20c0-4 4-6 8-6s8 2 8 6"/></svg>`;
+  return `
+    <div style="text-align:center;flex:1;min-width:0;">
+      <div style="width:64px;height:64px;border-radius:50%;background:#eef0f2;display:flex;align-items:center;justify-content:center;margin:0 auto 8px;overflow:hidden;">${avatarInner}</div>
+      <div style="font-weight:600;font-size:13px;line-height:1.3;">${esc(fullName(p))}</div>
+      ${label ? `<div style="margin-top:6px;color:var(--accent-dark);font-weight:700;font-size:13px;">${esc(label)}</div>` : ''}
+    </div>`;
+}
+
+function showRelationshipResult(idA, idB){
+  clearRelationshipSelection();
+  const result = describeRelationship(idA, idB);
+  const A = state.people[idA], B = state.people[idB];
+  const backdrop = document.createElement('div');
+  backdrop.className = 'modal-backdrop';
+  const bodyHtml = result
+    ? `<div style="display:flex;gap:16px;align-items:flex-start;justify-content:center;">${relCardHtml(A, result.labelA)}${relCardHtml(B, result.labelB)}</div>${result.generic ? `<p class="hint-text" style="margin-top:14px;text-align:center;">Родство очень дальнее — конкретного слова для него обычно не используют.</p>` : ''}`
+    : `<div style="display:flex;gap:16px;align-items:flex-start;justify-content:center;margin-bottom:10px;">${relCardHtml(A)}${relCardHtml(B)}</div><p class="hint-text" style="text-align:center;">Родство не найдено.</p>`;
+  backdrop.innerHTML = `
+    <div class="modal">
+      <div class="modal-header"><h2>Родство</h2><button class="modal-close">&times;</button></div>
+      <div class="modal-body">${bodyHtml}</div>
+    </div>`;
+  modalRoot.innerHTML = '';
+  modalRoot.appendChild(backdrop);
+  backdrop.querySelector('.modal-close').onclick = closeModal;
+  backdrop.addEventListener('click', e=>{ if(e.target===backdrop) closeModal(); });
+}
+
+// Tapping empty space (not a card) while someone is selected cancels the
+// pick — "никого не выбрал", as opposed to forcing a comparison.
+sceneWrap.addEventListener('click', (e)=>{
+  if(relationshipSelection && !e.target.closest('.person-card')){
+    clearRelationshipSelection();
+  }
+});
 
 /* =========================================================
    CAMERA (pan + zoom via CSS transform — the standard technique used by
