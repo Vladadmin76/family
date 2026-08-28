@@ -256,7 +256,7 @@
 <body>
 <div id="app">
   <div id="topbar">
-    <h1>Семейное древо <span id="appVersion" style="font-size:11px;font-weight:400;color:#999;">v0.3</span></h1>
+    <h1>Семейное древо <span id="appVersion" style="font-size:11px;font-weight:400;color:#999;">v0.4</span></h1>
     <div class="spacer"></div>
     <button id="btnSettings" title="Меню">&#9881;</button>
   </div>
@@ -676,48 +676,40 @@ function packLevel(levelNodes){
   });
 }
 
-// Phase 3: nudge each node toward the average position of whatever it's
-// actually connected to (its own children for an ordinary row, or the
-// specific owning card for a parentBlock), but never past the midpoint gap
-// to its already-processed left neighbor in the SAME fixed order — so a
-// node can move to look better aligned, but can never move far enough to
-// re-create an overlap. A few passes let this settle into a good compromise
-// between "no overlap" (guaranteed structurally) and "parents roughly
-// centered over children" (the visual goal).
-function alignLevel(levelNodes, personCardCx){
-  let prevRightEdge = -Infinity;
-  levelNodes.forEach(node=>{
-    if(node.alreadyPlacedElsewhere) return;
-    const w = nodeWidth(node);
-    // Pull toward the average of everything this node is actually connected
-    // to — its own children (so a couple centers over their kids), the
-    // specific card it's a parentBlock for, AND, just as importantly, its
-    // OWN parent's position. That last one was missing before: a childless
-    // leaf (or a small subtree with nothing of its own to align to) had no
-    // pull toward its parent at all, so it just sat wherever the initial
-    // left-to-right packing put it — which could be on the far side of the
-    // screen from the very couple it belongs to, once that couple wasn't the
-    // first child processed in their own parents' row.
-    const pts = [];
-    if(node.isParentBlock){
-      const ownerX = personCardCx(node.ownerMemberId);
-      if(ownerX != null) pts.push(ownerX);
-    }
-    if(node.childNodes && node.childNodes.length){
-      node.childNodes.filter(c=>!c.alreadyPlacedElsewhere).forEach(c=> pts.push(primaryCardCx(c)));
-    }
-    if(node.parentRef && !node.parentRef.alreadyPlacedElsewhere){
-      pts.push(node.parentRef.x);
-    }
-    const ideal = pts.length ? pts.reduce((a,b)=>a+b,0)/pts.length : node.x;
-    const minX = prevRightEdge===-Infinity ? -Infinity : prevRightEdge + SIBLING_GAP + w/2;
-    node.x = Math.max(ideal, minX);
-    prevRightEdge = node.x + w/2;
+// Phase 3: Brandes–Köpf–style directional sweeps, instead of the naive
+// "repeatedly average with both parent AND children, over and over" approach
+// we tried first — that one turned out to feed back on itself (a node's
+// position depends on a neighbor whose position depends right back on this
+// node's), so each pass amplified the last and the whole layout diverged to
+// infinity on any family shape with this kind of loop, e.g. a parentBlock
+// attached to one sibling's spouse in a multi-child family. The established
+// fix (per Brandes & Köpf, 2001, the standard coordinate-assignment step in
+// Sugiyama-style layered graph drawing) is to never let a sweep read a value
+// it might later change: each directional sweep only ever pulls a node
+// toward positions in OTHER levels that are already fully finalized for that
+// sweep, then the (at most two, here) directional results are combined by a
+// plain average at the end. That structurally cannot resonate — there's no
+// pass where two nodes are each computed from the other's not-yet-final value.
+function directionalSweep(levels, levelOrder, pull){
+  const posX = {};
+  levels.forEach(lvl=>{
+    let prevRightEdge = -Infinity;
+    levelOrder[lvl].forEach(node=>{
+      if(node.alreadyPlacedElsewhere) return;
+      const w = nodeWidth(node);
+      const ideal = pull(node, posX);
+      const minX = prevRightEdge===-Infinity ? -Infinity : prevRightEdge + SIBLING_GAP + w/2;
+      const x = ideal!=null ? Math.max(ideal, minX) : Math.max(node.x, minX);
+      posX[node.orderKey] = x;
+      prevRightEdge = x + w/2;
+    });
   });
+  return posX;
 }
 
 function buildLayout(){
   const {allNodes, levelOrder} = buildTree();
+  const levels = Object.keys(levelOrder).map(Number).sort((a,b)=>a-b);
 
   // a lookup from ANY person's id (primary or spouse) to the row-node that
   // displays their card, needed to find a parentBlock owner's exact position
@@ -727,20 +719,70 @@ function buildLayout(){
     nodeByAnyPersonId[n.id] = n;
     personSpouses(n.id).forEach(s=> nodeByAnyPersonId[s.personId] = n);
   });
-  function personCardCx(personId){
+  function specificCardX(personId, posX){
     const node = nodeByAnyPersonId[personId];
     if(!node) return null;
     const rowW = ownRowWidth(node.id);
     const members = [node.id, ...personSpouses(node.id).map(s=>s.personId)];
     const idx = members.indexOf(personId);
     if(idx<0) return null;
-    return node.x - rowW/2 + CARD_W/2 + idx*(CARD_W+CARD_GAP);
+    const baseX = (posX && posX[node.orderKey]!=null) ? posX[node.orderKey] : node.x;
+    return baseX - rowW/2 + CARD_W/2 + idx*(CARD_W+CARD_GAP);
+  }
+  function childSpecificX(childNode, posX){
+    const x = (posX && posX[childNode.orderKey]!=null) ? posX[childNode.orderKey] : childNode.x;
+    if(childNode.type==='leaf') return x;
+    return x - ownRowWidth(childNode.id)/2 + CARD_W/2;
   }
 
-  Object.values(levelOrder).forEach(packLevel);
-  for(let iter=0; iter<6; iter++){
-    Object.values(levelOrder).forEach(levelNodes=> alignLevel(levelNodes, personCardCx));
-  }
+  levels.forEach(lvl => packLevel(levelOrder[lvl]));
+
+  // Sweep A: ancestors -> descendants (low level to high). Each node pulls
+  // toward its OWN parent, which — since parents always sit at a lower
+  // level than their children — is already finalized earlier in this sweep.
+  const downX = directionalSweep(levels, levelOrder, (node, posX)=>{
+    if(node.parentRef && !node.parentRef.alreadyPlacedElsewhere){
+      // Pull toward the PARENT ROW'S OVERALL center, not one specific
+      // member's card — a shared child belongs equally to both partners.
+      return posX[node.parentRef.orderKey] != null ? posX[node.parentRef.orderKey] : node.parentRef.x;
+    }
+    return null;
+  });
+
+  // Sweep B: descendants -> ancestors (high level to low). Each node pulls
+  // toward its own children's average AND, for a parentBlock, its specific
+  // owner — both always at a HIGHER level, so already finalized in this
+  // reverse sweep.
+  const reversedLevels = levels.slice().reverse();
+  const upX = directionalSweep(reversedLevels, levelOrder, (node, posX)=>{
+    const pts = [];
+    if(node.isParentBlock){
+      const ownerX = specificCardX(node.ownerMemberId, posX);
+      if(ownerX != null) pts.push(ownerX);
+    }
+    if(node.childNodes && node.childNodes.length){
+      node.childNodes.filter(c=>!c.alreadyPlacedElsewhere).forEach(c=> pts.push(childSpecificX(c, posX)));
+    }
+    return pts.length ? pts.reduce((a,b)=>a+b,0)/pts.length : null;
+  });
+
+  // Combine the two directional results, then one final same-level pass to
+  // guarantee the combination itself introduced no new overlap.
+  allNodes.forEach(node=>{
+    if(node.alreadyPlacedElsewhere) return;
+    const d = downX[node.orderKey], u = upX[node.orderKey];
+    node.x = (d!=null && u!=null) ? (d+u)/2 : (d!=null ? d : (u!=null ? u : node.x));
+  });
+  levels.forEach(lvl=>{
+    let prevRightEdge = -Infinity;
+    levelOrder[lvl].forEach(node=>{
+      if(node.alreadyPlacedElsewhere) return;
+      const w = nodeWidth(node);
+      const minX = prevRightEdge===-Infinity ? -Infinity : prevRightEdge + SIBLING_GAP + w/2;
+      if(node.x < minX) node.x = minX;
+      prevRightEdge = node.x + w/2;
+    });
+  });
 
   return {nodes: allNodes};
 }
