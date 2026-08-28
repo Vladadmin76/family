@@ -256,7 +256,7 @@
 <body>
 <div id="app">
   <div id="topbar">
-    <h1>Семейное древо <span id="appVersion" style="font-size:11px;font-weight:400;color:#999;">v0.7</span></h1>
+    <h1>Семейное древо <span id="appVersion" style="font-size:11px;font-weight:400;color:#999;">v0.9</span></h1>
     <div class="spacer"></div>
     <button id="btnSettings" title="Меню">&#9881;</button>
   </div>
@@ -520,8 +520,21 @@ function findRootPersons(){
         if(!compVisited.has(n)){ compVisited.add(n); queue.push(n); }
       });
     }
-    const noParent = comp.find(id=>!state.people[id].parentUnionId);
-    roots.push(noParent || comp[0]);
+    // Prefer a "no parent" candidate whose spouse(s) ALSO have no recorded
+    // parents — i.e. neither side of that specific couple traces back any
+    // further. If we instead started from someone whose SPOUSE has known
+    // ancestry (e.g. we don't know this person's own parents, but their
+    // husband's parents ARE on the tree), the spouse-marking that keeps a
+    // couple sharing one row would silently swallow the husband before his
+    // own splitChildren ever got a turn to reach his real parents — his
+    // whole side of the family would just vanish, with no connector and no
+    // error. Falling back to ANY no-parent candidate only when no such
+    // "both sides unknown" couple exists keeps every real lineage reachable.
+    const noParentCandidates = comp.filter(id=>!state.people[id].parentUnionId);
+    const bothSidesUnknown = noParentCandidates.find(id=>{
+      return personSpouses(id).every(s=> !state.people[s.personId].parentUnionId);
+    });
+    roots.push(bothSidesUnknown || noParentCandidates[0] || comp[0]);
   });
   return roots;
 }
@@ -970,19 +983,29 @@ function render(){
     const bottomY = yFor(node.level);
     const topY = bottomY - CARD_H;
 
-    // A down-connector for EACH SPOUSE in this row who has parents — a
+    // A down-connector for each SPOUSE in this row who has parents — a
     // married-in spouse's ancestry (a parentBlock) isn't reachable any other
-    // way. The PRIMARY's own parent connection is deliberately skipped here:
-    // it's already drawn once, from the parent's own "up to children" bar
-    // below — drawing it again here as well (with a different bend height)
-    // used to produce two slightly different lines between the same two
-    // cards, which is exactly the "doubled line" artifact this replaced.
+    // way. The PRIMARY's own parent connection is normally skipped here: it's
+    // already drawn once, from the parent's own "up to children" bar below —
+    // drawing it again as well (with a different bend height) produces two
+    // slightly different lines between the same two cards.
+    //
+    // EXCEPT when this row is ITSELF a parentBlock (isParentBlock): then the
+    // primary's own parent was reached by a completely different route — as
+    // THEIR own ownerMemberId attachment, discovered while building THIS
+    // row — not via the normal "someone's actual child" upward expansion.
+    // That parent's row does still try to rediscover this primary as one of
+    // its own real children (everything always expands upward too), but
+    // finds them already claimed and gets back an empty ghost reference — so
+    // its "up to children" bar never reaches this primary at all. Only THIS
+    // primary's own down-connector can draw that link, so it can't be
+    // skipped here the way a normal primary's can.
     const rowW = ownRowWidth(node.id);
     const rowMembers = [node.id, ...personSpouses(node.id).map(s=>s.personId)];
     let memberCx = node.x - rowW/2 + CARD_W/2;
     rowMembers.forEach((mid, memberIdx)=>{
       const mp = state.people[mid];
-      if(memberIdx>0 && mp.parentUnionId){
+      if((memberIdx>0 || node.isParentBlock) && mp.parentUnionId){
         const pu = state.unions[mp.parentUnionId];
         const parentIds = [pu.partner1Id, pu.partner2Id].filter(Boolean);
         const parentNode = parentIds.map(pid=>nodeByPersonId[pid]).find(Boolean);
@@ -1002,7 +1025,15 @@ function render(){
       const actualBarY = topY - 30;
       const stemX = primaryCardCx(node);
       svg.appendChild(el('path', {d:`M ${stemX} ${topY} L ${stemX} ${actualBarY}`, class:'conn-line'}));
-      const xs = childTops.map(c=>c.x);
+      // The horizontal bar must span from the PARENT's own stem position too,
+      // not just between the children — when a row has only one real child
+      // (the common case once the others turn out to be ghosts, married
+      // elsewhere), the children-only span collapses to a single point that
+      // can sit nowhere near the parent's own stem (e.g. their row is wide
+      // because of a second spouse), leaving two disconnected line
+      // fragments instead of one continuous path. This is the root cause
+      // behind every "hanging stub" report so far.
+      const xs = childTops.map(c=>c.x).concat([stemX]);
       svg.appendChild(el('path', {d:`M ${Math.min(...xs)} ${actualBarY} L ${Math.max(...xs)} ${actualBarY}`, class:'conn-line'}));
       childTops.forEach(c=>{
         svg.appendChild(el('path', {d:`M ${c.x} ${actualBarY} L ${c.x} ${c.y}`, class:'conn-line'}));
