@@ -638,6 +638,7 @@ function buildTree(){
     const kids = splitChildren(node.id);
     node.childNodes = kids;
     kids.forEach(cn=> visit(cn, level+1));
+    kids.forEach(cn=>{ if(!cn.alreadyPlacedElsewhere) cn.parentRef = node; });
 
     const members = [node.id, ...personSpouses(node.id).map(s=>s.personId)];
     const seenParentUnion = new Set();
@@ -688,14 +689,27 @@ function alignLevel(levelNodes, personCardCx){
   levelNodes.forEach(node=>{
     if(node.alreadyPlacedElsewhere) return;
     const w = nodeWidth(node);
-    let ideal = node.x;
+    // Pull toward the average of everything this node is actually connected
+    // to — its own children (so a couple centers over their kids), the
+    // specific card it's a parentBlock for, AND, just as importantly, its
+    // OWN parent's position. That last one was missing before: a childless
+    // leaf (or a small subtree with nothing of its own to align to) had no
+    // pull toward its parent at all, so it just sat wherever the initial
+    // left-to-right packing put it — which could be on the far side of the
+    // screen from the very couple it belongs to, once that couple wasn't the
+    // first child processed in their own parents' row.
+    const pts = [];
     if(node.isParentBlock){
       const ownerX = personCardCx(node.ownerMemberId);
-      if(ownerX != null) ideal = ownerX;
-    } else if(node.childNodes && node.childNodes.length){
-      const pts = node.childNodes.filter(c=>!c.alreadyPlacedElsewhere).map(c=>primaryCardCx(c));
-      if(pts.length) ideal = pts.reduce((a,b)=>a+b,0)/pts.length;
+      if(ownerX != null) pts.push(ownerX);
     }
+    if(node.childNodes && node.childNodes.length){
+      node.childNodes.filter(c=>!c.alreadyPlacedElsewhere).forEach(c=> pts.push(primaryCardCx(c)));
+    }
+    if(node.parentRef && !node.parentRef.alreadyPlacedElsewhere){
+      pts.push(node.parentRef.x);
+    }
+    const ideal = pts.length ? pts.reduce((a,b)=>a+b,0)/pts.length : node.x;
     const minX = prevRightEdge===-Infinity ? -Infinity : prevRightEdge + SIBLING_GAP + w/2;
     node.x = Math.max(ideal, minX);
     prevRightEdge = node.x + w/2;
