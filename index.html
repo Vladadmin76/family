@@ -256,7 +256,7 @@
 <body>
 <div id="app">
   <div id="topbar">
-    <h1>Семейное древо <span id="appVersion" style="font-size:11px;font-weight:400;color:#999;">v0.6</span></h1>
+    <h1>Семейное древо <span id="appVersion" style="font-size:11px;font-weight:400;color:#999;">v0.7</span></h1>
     <div class="spacer"></div>
     <button id="btnSettings" title="Меню">&#9881;</button>
   </div>
@@ -698,7 +698,7 @@ function directionalSweep(levels, levelOrder, pull){
     levelOrder[lvl].forEach(node=>{
       if(node.alreadyPlacedElsewhere) return;
       const w = nodeWidth(node);
-      const ideal = pull(node, posX);
+      const ideal = pull(node, posX, hadIdeal);
       const minX = prevRightEdge===-Infinity ? -Infinity : prevRightEdge + SIBLING_GAP + w/2;
       const x = ideal!=null ? Math.max(ideal, minX) : Math.max(node.x, minX);
       posX[node.orderKey] = x;
@@ -713,6 +713,51 @@ function directionalSweep(levels, levelOrder, pull){
       hadIdeal[node.orderKey] = (ideal != null);
       prevRightEdge = x + w/2;
     });
+  });
+  return {posX, hadIdeal};
+}
+
+// The "ancestors -> descendants" sweep needs one refinement beyond a plain
+// per-node pull: when SEVERAL siblings share the same parentRef, pulling
+// each one individually toward that same single point and then clamping
+// them left-to-right doesn't center the group — the first sibling lands
+// exactly on the parent's x and every next one gets pushed further right,
+// so the sibling GROUP's own visual center drifts right of the true parent
+// center as group size grows. Established graph-drawing practice treats a
+// same-parent sibling block as a single unit for this reason: measure its
+// total width first, THEN center that whole block under the parent, THEN
+// lay siblings out left-to-right within it. (Two children was enough to see
+// this drift; a lone child never revealed it, which is why it slipped
+// through earlier.)
+function downSweepGroupedBySibling(levels, levelOrder){
+  const posX = {};
+  const hadIdeal = {};
+  levels.forEach(lvl=>{
+    const nodes = levelOrder[lvl].filter(n=>!n.alreadyPlacedElsewhere);
+    let i = 0;
+    let prevRightEdge = -Infinity;
+    while(i < nodes.length){
+      const groupParent = nodes[i].parentRef;
+      let j = i+1;
+      while(j < nodes.length && nodes[j].parentRef === groupParent) j++;
+      const group = nodes.slice(i, j);
+      const totalW = group.reduce((sum,n,idx)=> sum + nodeWidth(n) + (idx>0?SIBLING_GAP:0), 0);
+      const parentOk = groupParent && !groupParent.alreadyPlacedElsewhere;
+      const groupCenter = parentOk
+        ? (posX[groupParent.orderKey] != null ? posX[groupParent.orderKey] : groupParent.x)
+        : null;
+      let groupLeft = groupCenter!=null ? groupCenter - totalW/2 : group[0].x - nodeWidth(group[0])/2;
+      if(groupLeft < prevRightEdge + SIBLING_GAP) groupLeft = prevRightEdge + SIBLING_GAP;
+      let cursor = groupLeft;
+      group.forEach(n=>{
+        const w = nodeWidth(n);
+        posX[n.orderKey] = cursor + w/2;
+        hadIdeal[n.orderKey] = parentOk;
+        cursor += w + SIBLING_GAP;
+      });
+      prevRightEdge = cursor - SIBLING_GAP;
+      i = j;
+    }
   });
   return {posX, hadIdeal};
 }
@@ -747,22 +792,11 @@ function buildLayout(){
 
   levels.forEach(lvl => packLevel(levelOrder[lvl]));
 
-  // Sweep A: ancestors -> descendants (low level to high). Each node pulls
-  // toward its OWN parent, which — since parents always sit at a lower
-  // level than their children — is already finalized earlier in this sweep.
-  const down = directionalSweep(levels, levelOrder, (node, posX)=>{
-    if(node.parentRef && !node.parentRef.alreadyPlacedElsewhere){
-      // Pull toward the PARENT ROW'S OVERALL center, not one specific
-      // member's card — a shared child belongs equally to both partners.
-      return posX[node.parentRef.orderKey] != null ? posX[node.parentRef.orderKey] : node.parentRef.x;
-    }
-    return null;
-  });
-
-  // Sweep B: descendants -> ancestors (high level to low). Each node pulls
-  // toward its own children's average AND, for a parentBlock, its specific
-  // owner — both always at a HIGHER level, so already finalized in this
-  // reverse sweep.
+  // PASS 1 — bottom-up (descendants -> ancestors): every node with real
+  // children, or a parentBlock with a real owner, gets a position based on
+  // that — the one thing it's actually, structurally connected to. This
+  // alone covers most of the tree; a childless leaf just keeps its initial
+  // packed slot for now, to be replaced in pass 2.
   const reversedLevels = levels.slice().reverse();
   const up = directionalSweep(reversedLevels, levelOrder, (node, posX)=>{
     const pts = [];
@@ -775,25 +809,12 @@ function buildLayout(){
     }
     return pts.length ? pts.reduce((a,b)=>a+b,0)/pts.length : null;
   });
-
-  // Combine the two directional results — but only average the sweeps that
-  // actually had something to base a position on. A childless leaf has no
-  // opinion in the "descendants -> ancestors" sweep at all (nothing pulls it
-  // from above), so that sweep's value for it is just leftover packing order,
-  // not a real vote; averaging it in would drag a perfectly good
-  // "pulled toward my parent" answer back toward nothing in particular —
-  // which is exactly what put Darya and Dmitry off to the side instead of
-  // under Yulia and Vladimir.
   allNodes.forEach(node=>{
     if(node.alreadyPlacedElsewhere) return;
-    const dOk = down.hadIdeal[node.orderKey], uOk = up.hadIdeal[node.orderKey];
-    const d = down.posX[node.orderKey], u = up.posX[node.orderKey];
-    if(dOk && uOk) node.x = (d+u)/2;
-    else if(dOk) node.x = d;
-    else if(uOk) node.x = u;
-    else node.x = d;
+    if(up.hadIdeal[node.orderKey]) node.x = up.posX[node.orderKey];
   });
-  levels.forEach(lvl=>{
+
+  function clampLevel(lvl){
     let prevRightEdge = -Infinity;
     levelOrder[lvl].forEach(node=>{
       if(node.alreadyPlacedElsewhere) return;
@@ -802,6 +823,55 @@ function buildLayout(){
       if(node.x < minX) node.x = minX;
       prevRightEdge = node.x + w/2;
     });
+  }
+
+  function fillGroupsAtLevel(lvl){
+    const nodes = levelOrder[lvl].filter(n=>!n.alreadyPlacedElsewhere && !up.hadIdeal[n.orderKey]);
+    let i = 0;
+    while(i < nodes.length){
+      const groupParent = nodes[i].parentRef;
+      let j = i+1;
+      while(j < nodes.length && nodes[j].parentRef === groupParent) j++;
+      const group = nodes.slice(i, j);
+      const totalW = group.reduce((sum,n,idx)=> sum + nodeWidth(n) + (idx>0?SIBLING_GAP:0), 0);
+      const parentOk = groupParent && !groupParent.alreadyPlacedElsewhere;
+      const groupCenter = parentOk ? groupParent.x : null;
+      let groupLeft = groupCenter!=null ? groupCenter - totalW/2 : group[0].x - nodeWidth(group[0])/2;
+      let cursor = groupLeft;
+      group.forEach(n=>{
+        const w = nodeWidth(n);
+        n.x = cursor + w/2;
+        cursor += w + SIBLING_GAP;
+      });
+      i = j;
+    }
+  }
+
+  // PASS 2 — top-down (ancestors -> descendants), ONLY for whatever pass 1
+  // left untouched. A node with no children and no parentBlock role has
+  // nothing of its own to be positioned from — the only thing left to place
+  // it sensibly is its actual parent. This is deliberately NOT an average of
+  // a pass-1 and pass-2 answer: averaging a real position with an arbitrary
+  // one is exactly what dragged correct answers off toward nothing in
+  // particular in earlier attempts. Siblings sharing a parent are grouped
+  // and centered as one block, not each pulled to the same single point.
+  //
+  // Crucially, this runs and CLAMPS one level at a time, strictly low to
+  // high. A level can contain a mix of pass-1 nodes (already final) and
+  // pass-2 nodes (just grouped here) — clamping immediately, before moving
+  // up to the next level, guarantees that by the time a HIGHER level reads
+  // a parent's x (via parentRef), that parent's position is truly its last
+  // word. Doing all of pass 2 first and clamping everything only at the very
+  // end let an untouched pass-1 parent get shoved sideways by ITS OWN
+  // same-level siblings needing separation — and since that shove happened
+  // AFTER a child one level up had already centered itself on the parent's
+  // pre-shove spot, the child was left behind at the stale position. This
+  // was exactly the remaining drift between Yulia and Darya/Dmitry: fixing
+  // it required realizing the clamp isn't a one-time cleanup step, it's part
+  // of what makes each level's answer final before the next level trusts it.
+  levels.forEach(lvl=>{
+    fillGroupsAtLevel(lvl);
+    clampLevel(lvl);
   });
 
   return {nodes: allNodes};
