@@ -2239,6 +2239,7 @@ function openSettingsMenu(){
     <button data-action="export">Экспорт</button>
     <button data-action="import">Импорт / Объединить</button>
     <button data-action="description">Описание</button>
+    <button data-action="about">О программе</button>
     <button data-action="reset" style="color:var(--danger);">Начать заново</button>
   `;
   document.body.appendChild(backdrop);
@@ -2249,6 +2250,7 @@ function openSettingsMenu(){
   pop.querySelector('[data-action="export"]').onclick = ()=>{ closePopover(); openExportNameModal(); };
   pop.querySelector('[data-action="import"]').onclick = ()=>{ closePopover(); fileInput.click(); };
   pop.querySelector('[data-action="description"]').onclick = ()=>{ closePopover(); openDescriptionModal(); };
+  pop.querySelector('[data-action="about"]').onclick = ()=>{ closePopover(); openAboutModal(); };
   pop.querySelector('[data-action="reset"]').onclick = ()=>{ closePopover(); confirmResetAllData(); };
   popoverRoot.appendChild(backdrop);
   popoverRoot.appendChild(pop);
@@ -2262,10 +2264,38 @@ function openDescriptionModal(){
     <div class="modal">
       <div class="modal-header"><h2>Описание</h2><button class="modal-close">&times;</button></div>
       <div class="modal-body">
-        <p class="hint-text">Здесь будет описание возможностей приложения — раздел пока пустой, будем дополнять его по мере добавления новых функций.</p>
+        <p class="hint-text" style="margin-bottom:14px;">Возможности приложения на сегодня:</p>
+        <ul style="margin:0 0 4px;padding-left:20px;font-size:14px;line-height:1.7;color:#333;">
+          <li>Построение дерева от себя: родители, супруг(и), дети, братья и сёстры — через кнопку «+» на карточке.</li>
+          <li>Фото человека с обрезкой под круг, воспоминания, дата рождения/смерти, отметка «умер(ла)» независимо от того, известны ли точные даты.</li>
+          <li>Свободное панорамирование и зум (в том числе жестом «щипок» на телефоне).</li>
+          <li>Экспорт дерева в файл и объединение двух файлов в один — например, когда муж и жена вели свои деревья по отдельности.</li>
+          <li><b>Определение родства:</b> долгое нажатие на карточку выделяет её жёлтой рамкой, затем нужно найти и нажать на вторую карточку — откроется окно с точным названием родства между ними (в том числе через брак: тесть, зять, шурин и т.д.). Нажатие на пустое место снимает выделение.</li>
+        </ul>
       </div>
     </div>`;
   modalRoot.appendChild(backdrop);
+  backdrop.querySelector('.modal-close').onclick = closeModal;
+  backdrop.addEventListener('click', e=>{ if(e.target===backdrop) closeModal(); });
+}
+
+function openAboutModal(){
+  const backdrop = document.createElement('div');
+  backdrop.className='modal-backdrop';
+  backdrop.innerHTML = `
+    <div class="modal">
+      <div class="modal-header"><h2>О программе</h2><button class="modal-close">&times;</button></div>
+      <div class="modal-body">
+        <p style="font-size:14px;line-height:1.8;color:#333;margin:0;">
+          <b>Семейное древо</b><br>
+          Версия <span id="aboutVersion"></span><br><br>
+          Разработчик: Красильниченко Владимир<br>
+          Тестировщик: Агаева Майя
+        </p>
+      </div>
+    </div>`;
+  modalRoot.appendChild(backdrop);
+  backdrop.querySelector('#aboutVersion').textContent = document.getElementById('appVersion').textContent;
   backdrop.querySelector('.modal-close').onclick = closeModal;
   backdrop.addEventListener('click', e=>{ if(e.target===backdrop) closeModal(); });
 }
