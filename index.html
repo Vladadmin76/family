@@ -256,7 +256,7 @@
 <body>
 <div id="app">
   <div id="topbar">
-    <h1>Семейное древо <span id="appVersion" style="font-size:11px;font-weight:400;color:#999;">v0.4</span></h1>
+    <h1>Семейное древо <span id="appVersion" style="font-size:11px;font-weight:400;color:#999;">v0.6</span></h1>
     <div class="spacer"></div>
     <button id="btnSettings" title="Меню">&#9881;</button>
   </div>
@@ -692,6 +692,7 @@ function packLevel(levelNodes){
 // pass where two nodes are each computed from the other's not-yet-final value.
 function directionalSweep(levels, levelOrder, pull){
   const posX = {};
+  const hadIdeal = {};
   levels.forEach(lvl=>{
     let prevRightEdge = -Infinity;
     levelOrder[lvl].forEach(node=>{
@@ -701,10 +702,19 @@ function directionalSweep(levels, levelOrder, pull){
       const minX = prevRightEdge===-Infinity ? -Infinity : prevRightEdge + SIBLING_GAP + w/2;
       const x = ideal!=null ? Math.max(ideal, minX) : Math.max(node.x, minX);
       posX[node.orderKey] = x;
+      // A node with nothing to pull toward in THIS sweep (e.g. a childless
+      // leaf, in the descendants->ancestors sweep) still needs SOME position
+      // recorded here so later same-level nodes clamp against a real value —
+      // but that fallback is just "wherever the initial packing put it", not
+      // an actual opinion. Tracking that separately is what lets the final
+      // combine step below use only the sweep(s) that had a real basis,
+      // instead of averaging a meaningful pull with an arbitrary one and
+      // dragging the result off toward nothing in particular.
+      hadIdeal[node.orderKey] = (ideal != null);
       prevRightEdge = x + w/2;
     });
   });
-  return posX;
+  return {posX, hadIdeal};
 }
 
 function buildLayout(){
@@ -740,7 +750,7 @@ function buildLayout(){
   // Sweep A: ancestors -> descendants (low level to high). Each node pulls
   // toward its OWN parent, which — since parents always sit at a lower
   // level than their children — is already finalized earlier in this sweep.
-  const downX = directionalSweep(levels, levelOrder, (node, posX)=>{
+  const down = directionalSweep(levels, levelOrder, (node, posX)=>{
     if(node.parentRef && !node.parentRef.alreadyPlacedElsewhere){
       // Pull toward the PARENT ROW'S OVERALL center, not one specific
       // member's card — a shared child belongs equally to both partners.
@@ -754,7 +764,7 @@ function buildLayout(){
   // owner — both always at a HIGHER level, so already finalized in this
   // reverse sweep.
   const reversedLevels = levels.slice().reverse();
-  const upX = directionalSweep(reversedLevels, levelOrder, (node, posX)=>{
+  const up = directionalSweep(reversedLevels, levelOrder, (node, posX)=>{
     const pts = [];
     if(node.isParentBlock){
       const ownerX = specificCardX(node.ownerMemberId, posX);
@@ -766,12 +776,22 @@ function buildLayout(){
     return pts.length ? pts.reduce((a,b)=>a+b,0)/pts.length : null;
   });
 
-  // Combine the two directional results, then one final same-level pass to
-  // guarantee the combination itself introduced no new overlap.
+  // Combine the two directional results — but only average the sweeps that
+  // actually had something to base a position on. A childless leaf has no
+  // opinion in the "descendants -> ancestors" sweep at all (nothing pulls it
+  // from above), so that sweep's value for it is just leftover packing order,
+  // not a real vote; averaging it in would drag a perfectly good
+  // "pulled toward my parent" answer back toward nothing in particular —
+  // which is exactly what put Darya and Dmitry off to the side instead of
+  // under Yulia and Vladimir.
   allNodes.forEach(node=>{
     if(node.alreadyPlacedElsewhere) return;
-    const d = downX[node.orderKey], u = upX[node.orderKey];
-    node.x = (d!=null && u!=null) ? (d+u)/2 : (d!=null ? d : (u!=null ? u : node.x));
+    const dOk = down.hadIdeal[node.orderKey], uOk = up.hadIdeal[node.orderKey];
+    const d = down.posX[node.orderKey], u = up.posX[node.orderKey];
+    if(dOk && uOk) node.x = (d+u)/2;
+    else if(dOk) node.x = d;
+    else if(uOk) node.x = u;
+    else node.x = d;
   });
   levels.forEach(lvl=>{
     let prevRightEdge = -Infinity;
@@ -880,16 +900,19 @@ function render(){
     const bottomY = yFor(node.level);
     const topY = bottomY - CARD_H;
 
-    // a down-connector for EVERY member of this row who has parents — the
-    // primary person AND any spouse each get their own line to their own
-    // parents, since a married-in spouse's ancestry is separate from the
-    // primary's and must not be skipped
+    // A down-connector for EACH SPOUSE in this row who has parents — a
+    // married-in spouse's ancestry (a parentBlock) isn't reachable any other
+    // way. The PRIMARY's own parent connection is deliberately skipped here:
+    // it's already drawn once, from the parent's own "up to children" bar
+    // below — drawing it again here as well (with a different bend height)
+    // used to produce two slightly different lines between the same two
+    // cards, which is exactly the "doubled line" artifact this replaced.
     const rowW = ownRowWidth(node.id);
     const rowMembers = [node.id, ...personSpouses(node.id).map(s=>s.personId)];
     let memberCx = node.x - rowW/2 + CARD_W/2;
-    rowMembers.forEach(mid=>{
+    rowMembers.forEach((mid, memberIdx)=>{
       const mp = state.people[mid];
-      if(mp.parentUnionId){
+      if(memberIdx>0 && mp.parentUnionId){
         const pu = state.unions[mp.parentUnionId];
         const parentIds = [pu.partner1Id, pu.partner2Id].filter(Boolean);
         const parentNode = parentIds.map(pid=>nodeByPersonId[pid]).find(Boolean);
@@ -907,7 +930,8 @@ function render(){
     if(realChildren.length){
       const childTops = realChildren.map(cn=>({x:primaryCardCx(cn), y:yFor(cn.level)}));
       const actualBarY = topY - 30;
-      svg.appendChild(el('path', {d:`M ${node.x} ${topY} L ${node.x} ${actualBarY}`, class:'conn-line'}));
+      const stemX = primaryCardCx(node);
+      svg.appendChild(el('path', {d:`M ${stemX} ${topY} L ${stemX} ${actualBarY}`, class:'conn-line'}));
       const xs = childTops.map(c=>c.x);
       svg.appendChild(el('path', {d:`M ${Math.min(...xs)} ${actualBarY} L ${Math.max(...xs)} ${actualBarY}`, class:'conn-line'}));
       childTops.forEach(c=>{
