@@ -256,7 +256,7 @@
 <body>
 <div id="app">
   <div id="topbar">
-    <h1>Семейное древо <span id="appVersion" style="font-size:11px;font-weight:400;color:#999;">v0.15</span></h1>
+    <h1>Семейное древо <span id="appVersion" style="font-size:11px;font-weight:400;color:#999;">v0.16</span></h1>
     <div class="spacer"></div>
     <button id="btnSettings" title="Меню">&#9881;</button>
   </div>
@@ -1831,13 +1831,24 @@ async function doExport(filenameNoExt){
   const filename = sanitizeFilename(filenameNoExt).replace(/\.json$/i,'') + '.json';
   const payload = JSON.stringify({state, counter}, null, 2);
   const blob = new Blob([payload], {type:'application/json'});
-  // Deliberately NOT using navigator.share() here — on WebKit-based mobile
-  // browsers (which includes "Chrome" on iPhone, since Apple requires every
-  // iOS browser to use WebKit under the hood) sharing a FILE through the
-  // native share sheet has a long history of unreliable behavior: instead
-  // of saving, it can end up just navigating to and displaying the raw blob
-  // content as a page. A plain anchor-with-download is the simpler,
-  // more predictable mechanism and doesn't invoke that share sheet at all.
+  // Try the native share sheet first (Save to Files / AirDrop / etc.) — this
+  // is what worked reliably before and gives an explicit "where do you want
+  // this" choice, rather than silently landing in the default Downloads
+  // location. Earlier trouble with this turned out to be from testing the
+  // page inside Claude's own in-app preview, not from share() itself, so
+  // it's back as the primary path with the plain download as a fallback for
+  // browsers where sharing files isn't available at all.
+  try{
+    if(navigator.canShare && navigator.share){
+      const file = new File([blob], filename, {type:'application/json'});
+      if(navigator.canShare({files:[file]})){
+        await navigator.share({files:[file]});
+        return;
+      }
+    }
+  }catch(e){
+    if(e && e.name === 'AbortError') return;
+  }
   try{
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
