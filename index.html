@@ -256,7 +256,7 @@
 <body>
 <div id="app">
   <div id="topbar">
-    <h1>Семейное древо <span id="appVersion" style="font-size:11px;font-weight:400;color:#999;">v0.11</span></h1>
+    <h1>Семейное древо <span id="appVersion" style="font-size:11px;font-weight:400;color:#999;">v0.15</span></h1>
     <div class="spacer"></div>
     <button id="btnSettings" title="Меню">&#9881;</button>
   </div>
@@ -1076,19 +1076,31 @@ function render(){
     // Long-press to pick this card for the relationship finder — a short
     // press still opens the profile as usual; only a sustained press (with
     // no drag in progress) counts as "select this one".
+    //
+    // Acting directly on pointerup here, instead of listening for the
+    // browser's own synthesized 'click', is deliberate: a touch held for
+    // roughly half a second — an entirely normal, unhurried tap — doesn't
+    // reliably produce a 'click' event on every mobile browser. Relying on
+    // it meant some completely ordinary taps were silently doing nothing.
+    // Pointer events fire immediately and consistently regardless of how
+    // long the touch was held, so driving the action from pointerup removes
+    // that unpredictability entirely rather than trying to compensate for it.
     let longPressTimer = null, longPressFired = false;
     div.addEventListener('pointerdown', (e)=>{
       if(e.target.closest('.add-btn')) return;
       longPressFired = false;
+      const pid = e.pointerId;
       longPressTimer = setTimeout(()=>{
         longPressFired = true;
-        suppressNextClick = true;
-        // Safety net: some browsers never synthesize a 'click' after a long
-        // enough press-and-hold, which would leave suppressNextClick stuck at
-        // true forever — silently swallowing the very next, unrelated tap
-        // anywhere in the app. Self-resetting shortly after guards against
-        // that regardless of whether a click actually follows.
-        setTimeout(()=>{ suppressNextClick = false; }, 400);
+        // selectForRelationship() re-renders the whole tree, which replaces
+        // every card in the DOM — including this one, mid-touch. The finger
+        // physically lifting off later fires pointerup on whatever NEW card
+        // element now happens to sit at that same spot, not on this one, so
+        // longPressFired here (tied to this soon-to-be-discarded element)
+        // can't protect against it. Recording the pointer's own id globally
+        // survives the swap: every card's pointerup checks it, regardless
+        // of which specific element ends up receiving that pointerup.
+        suppressPointerUpId = pid;
         selectForRelationship(p.id);
       }, 550);
     });
@@ -1097,25 +1109,28 @@ function render(){
         clearTimeout(longPressTimer); longPressTimer = null;
       }
     });
-    ['pointerup','pointercancel'].forEach(evt=> div.addEventListener(evt, ()=>{
-      if(longPressTimer){ clearTimeout(longPressTimer); longPressTimer = null; }
-    }));
-
-    div.addEventListener('click', (e)=>{
+    div.addEventListener('pointerup', (e)=>{
       if(e.target.closest('.add-btn')) return;
+      if(longPressTimer){ clearTimeout(longPressTimer); longPressTimer = null; }
       if(longPressFired){ longPressFired = false; return; }
-      if(relationshipSelection){
-        if(relationshipSelection === p.id) clearRelationshipSelection();
-        else showRelationshipResult(relationshipSelection, p.id);
-        return;
-      }
+      if(e.pointerId === suppressPointerUpId){ suppressPointerUpId = null; return; }
+      if(dragState && dragState.moved) return; // this pointer just finished panning, not tapping
+      if(activePointers.size > 1) return; // mid-pinch, not a tap
       if(p.isUnknown){
         openPersonModal(p.id, 'main');
+      } else if(relationshipSelection){
+        if(relationshipSelection === p.id) clearRelationshipSelection();
+        else showRelationshipResult(relationshipSelection, p.id);
       } else {
         openPersonViewModal(p.id);
       }
     });
-    div.querySelector('.add-btn').addEventListener('click', (e)=>{
+    div.addEventListener('pointercancel', ()=>{
+      if(longPressTimer){ clearTimeout(longPressTimer); longPressTimer = null; }
+    });
+    const addBtn = div.querySelector('.add-btn');
+    addBtn.addEventListener('pointerdown', (e)=> e.stopPropagation());
+    addBtn.addEventListener('pointerup', (e)=>{
       e.stopPropagation();
       if(relationshipSelection) return;
       openAddPopover(p.id, e.clientX, e.clientY);
@@ -1765,6 +1780,8 @@ function sanitizeFilename(s){
 }
 
 function suggestExportName(){
+  const remembered = localStorage.getItem('family-tree-last-export-name');
+  if(remembered) return remembered;
   const stamp = new Date().toISOString().slice(0,10);
   const firstReal = Object.values(state.people).find(p=>!p.isUnknown && (p.firstName||p.lastName));
   if(firstReal){
@@ -1814,17 +1831,13 @@ async function doExport(filenameNoExt){
   const filename = sanitizeFilename(filenameNoExt).replace(/\.json$/i,'') + '.json';
   const payload = JSON.stringify({state, counter}, null, 2);
   const blob = new Blob([payload], {type:'application/json'});
-  try{
-    if(navigator.canShare && navigator.share){
-      const file = new File([blob], filename, {type:'application/json'});
-      if(navigator.canShare({files:[file]})){
-        await navigator.share({files:[file]});
-        return;
-      }
-    }
-  }catch(e){
-    if(e && e.name === 'AbortError') return;
-  }
+  // Deliberately NOT using navigator.share() here — on WebKit-based mobile
+  // browsers (which includes "Chrome" on iPhone, since Apple requires every
+  // iOS browser to use WebKit under the hood) sharing a FILE through the
+  // native share sheet has a long history of unreliable behavior: instead
+  // of saving, it can end up just navigating to and displaying the raw blob
+  // content as a page. A plain anchor-with-download is the simpler,
+  // more predictable mechanism and doesn't invoke that share sheet at all.
   try{
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -1835,6 +1848,7 @@ async function doExport(filenameNoExt){
     a.click();
     document.body.removeChild(a);
     setTimeout(()=>URL.revokeObjectURL(url), 3000);
+    return; // the fallback below is only for when this whole approach throws
   }catch(e){ /* fall through */ }
   showExportFallback(payload, filename);
 }
@@ -1866,6 +1880,7 @@ function openExportNameModal(){
   input.setSelectionRange(0, input.value.length);
   backdrop.querySelector('#doExportBtn').onclick = async ()=>{
     const name = input.value.trim() || suggested;
+    localStorage.setItem('family-tree-last-export-name', name);
     closeModal();
     await doExport(name);
   };
@@ -2313,7 +2328,12 @@ const activePointers = new Map(); // pointerId -> {x, y}
 let dragState = null;      // single-pointer pan: {id, startX, startY, startCamX, startCamY, moved}
 let pinchState = null;     // two-pointer pinch: {startDist, startScale}
 let suppressNextClick = false;
-const DRAG_THRESHOLD = 6; // px of movement before a touch/click counts as a drag, not a tap
+// Set to a pointerId right when a long-press fires (which re-renders the
+// whole tree and swaps out every card element mid-touch); every card's own
+// pointerup checks this so the physical finger lift lands harmlessly no
+// matter which freshly-rebuilt element it happens to end up over.
+let suppressPointerUpId = null;
+const DRAG_THRESHOLD = 12; // px of movement before a touch/click counts as a drag, not a tap — above Android's own 8dp "touch slop" standard, since 6 was tight enough that ordinary finger jitter during a tap could misfire as a drag and swallow the click
 
 function recomputePinchState(){
   const pts = Array.from(activePointers.values());
