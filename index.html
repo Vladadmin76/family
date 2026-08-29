@@ -26,15 +26,16 @@
   #topbar{
     display:flex;align-items:center;gap:8px;
     padding:8px 10px;
-    background:var(--paper);
+    background:#4fc3f7;
     border-bottom:1px solid #ddd;
     z-index:50;
     flex-wrap:wrap;
   }
-  #topbar h1{font-size:16px;margin:0 10px 0 4px;font-weight:600;color:var(--accent-dark);white-space:nowrap;}
+  #topbar h1{font-size:16px;margin:0 10px 0 4px;font-weight:600;color:#1b5e3c;white-space:nowrap;}
+  #topbar h1 #appVersion{color:#ff9800 !important;opacity:0.85;}
   #btnSettings{
     width:38px;height:38px;border-radius:50%;border:1px solid #c9ccd0;
-    background:#f5f6f7;color:var(--accent-dark);font-size:18px;cursor:pointer;
+    background:#f5f6f7;color:#ff9800;font-size:18px;cursor:pointer;
     display:flex;align-items:center;justify-content:center;
   }
   .btn{
@@ -72,8 +73,9 @@
   #cardLayer{position:absolute; left:0; top:0; width:100%; height:100%; pointer-events:none;}
   #cardLayer .person-card{pointer-events:auto;}
   #zoomControls{
+    display:none; /* zoom buttons removed per request — pinch-to-zoom still works */
     position:fixed;right:14px;bottom:18px;z-index:60;
-    display:flex;flex-direction:column;gap:8px;
+    flex-direction:column;gap:8px;
   }
   #zoomControls button{
     width:42px;height:42px;border-radius:50%;border:1px solid #c9ccd0;
@@ -82,7 +84,6 @@
   }
   svg#tree-svg{display:block;overflow:visible;}
   .conn-line{fill:none;stroke:#9aa0a6;stroke-width:2;stroke-linecap:round;}
-  .conn-label{font-size:11px;fill:#8a8f95;text-anchor:middle;font-style:italic;}
   .empty-hint{
     position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
     flex-direction:column;gap:14px;text-align:center;padding:20px;
@@ -256,7 +257,7 @@
 <body>
 <div id="app">
   <div id="topbar">
-    <h1>Семейное древо <span id="appVersion" style="font-size:11px;font-weight:400;color:#999;">v0.16</span></h1>
+    <h1>Семейное древо <span id="appVersion" style="font-size:11px;font-weight:400;color:#999;">v0.21</span></h1>
     <div class="spacer"></div>
     <button id="btnSettings" title="Меню">&#9881;</button>
   </div>
@@ -327,11 +328,6 @@ function fullName(p){
   if(!p) return '?';
   if(p.isUnknown) return '?';
   return [p.lastName, p.firstName, p.middleName].filter(Boolean).join(' ') || '(без имени)';
-}
-function shortName(p){
-  if(!p) return '?';
-  if(p.isUnknown) return '?';
-  return p.firstName || '(без имени)';
 }
 function yearOf(dateStr){
   if(!dateStr) return null;
@@ -425,12 +421,6 @@ function addParentsTo(personId){
   return union;
 }
 
-function fillUnknownPerson(personId, data){
-  const p = state.people[personId];
-  Object.assign(p, data, {isUnknown:false});
-  return p;
-}
-
 // Removes a person while keeping the rest of the tree structurally valid:
 // - if they were someone's child, they're dropped from that union's list
 // - if they were a partner in a union THAT HAS CHILDREN, they're replaced by a
@@ -481,7 +471,6 @@ const CARD_W = 140, CARD_H = 172;
 const CARD_GAP = 4;              // spouses sit almost touching, just enough to see two borders
 const SIBLING_GAP = CARD_W/2;    // siblings spaced about half a card-width apart
 const LEVEL_HEIGHT = 240;
-const LEAF_SLOT = CARD_W;
 const BASE_Y = 6000;
 
 // A "person group" = one person's own card + ALL of their spouses' cards side by
@@ -581,15 +570,6 @@ function ownRowWidth(personId){
   return (1+spouses.length)*CARD_W + spouses.length*CARD_GAP;
 }
 
-// The exact screen X of a node's OWN card — as opposed to node.x, which for a
-// married node is the midpoint of the whole couple's row. Every 'person' node
-// is always anchored on its primary (their spouse, if any, is drawn after
-// them), so this is what a connector line should point to when the line is
-// about that SPECIFIC person, not their marriage.
-function primaryCardCx(node){
-  if(node.type==='leaf') return node.x;
-  return node.x - ownRowWidth(node.id)/2 + CARD_W/2;
-}
 function nodeWidth(node){
   return node.type==='person' ? ownRowWidth(node.id) : CARD_W;
 }
@@ -726,51 +706,6 @@ function directionalSweep(levels, levelOrder, pull){
       hadIdeal[node.orderKey] = (ideal != null);
       prevRightEdge = x + w/2;
     });
-  });
-  return {posX, hadIdeal};
-}
-
-// The "ancestors -> descendants" sweep needs one refinement beyond a plain
-// per-node pull: when SEVERAL siblings share the same parentRef, pulling
-// each one individually toward that same single point and then clamping
-// them left-to-right doesn't center the group — the first sibling lands
-// exactly on the parent's x and every next one gets pushed further right,
-// so the sibling GROUP's own visual center drifts right of the true parent
-// center as group size grows. Established graph-drawing practice treats a
-// same-parent sibling block as a single unit for this reason: measure its
-// total width first, THEN center that whole block under the parent, THEN
-// lay siblings out left-to-right within it. (Two children was enough to see
-// this drift; a lone child never revealed it, which is why it slipped
-// through earlier.)
-function downSweepGroupedBySibling(levels, levelOrder){
-  const posX = {};
-  const hadIdeal = {};
-  levels.forEach(lvl=>{
-    const nodes = levelOrder[lvl].filter(n=>!n.alreadyPlacedElsewhere);
-    let i = 0;
-    let prevRightEdge = -Infinity;
-    while(i < nodes.length){
-      const groupParent = nodes[i].parentRef;
-      let j = i+1;
-      while(j < nodes.length && nodes[j].parentRef === groupParent) j++;
-      const group = nodes.slice(i, j);
-      const totalW = group.reduce((sum,n,idx)=> sum + nodeWidth(n) + (idx>0?SIBLING_GAP:0), 0);
-      const parentOk = groupParent && !groupParent.alreadyPlacedElsewhere;
-      const groupCenter = parentOk
-        ? (posX[groupParent.orderKey] != null ? posX[groupParent.orderKey] : groupParent.x)
-        : null;
-      let groupLeft = groupCenter!=null ? groupCenter - totalW/2 : group[0].x - nodeWidth(group[0])/2;
-      if(groupLeft < prevRightEdge + SIBLING_GAP) groupLeft = prevRightEdge + SIBLING_GAP;
-      let cursor = groupLeft;
-      group.forEach(n=>{
-        const w = nodeWidth(n);
-        posX[n.orderKey] = cursor + w/2;
-        hadIdeal[n.orderKey] = parentOk;
-        cursor += w + SIBLING_GAP;
-      });
-      prevRightEdge = cursor - SIBLING_GAP;
-      i = j;
-    }
   });
   return {posX, hadIdeal};
 }
@@ -1090,7 +1025,12 @@ function render(){
       if(e.target.closest('.add-btn')) return;
       longPressFired = false;
       const pid = e.pointerId;
+      const cancelThis = ()=>{
+        if(longPressTimer){ clearTimeout(longPressTimer); longPressTimer = null; }
+        activeLongPressCancels.delete(cancelThis);
+      };
       longPressTimer = setTimeout(()=>{
+        activeLongPressCancels.delete(cancelThis);
         longPressFired = true;
         // selectForRelationship() re-renders the whole tree, which replaces
         // every card in the DOM — including this one, mid-touch. The finger
@@ -1103,6 +1043,7 @@ function render(){
         suppressPointerUpId = pid;
         selectForRelationship(p.id);
       }, 550);
+      activeLongPressCancels.add(cancelThis);
     });
     div.addEventListener('pointermove', ()=>{
       if(longPressTimer && dragState && dragState.moved){
@@ -1116,6 +1057,7 @@ function render(){
       if(e.pointerId === suppressPointerUpId){ suppressPointerUpId = null; return; }
       if(dragState && dragState.moved) return; // this pointer just finished panning, not tapping
       if(activePointers.size > 1) return; // mid-pinch, not a tap
+      if(Date.now() - lastPinchEndAt < 400) return; // this lift is just the tail end of a pinch, not a fresh tap
       if(p.isUnknown){
         openPersonModal(p.id, 'main');
       } else if(relationshipSelection){
@@ -1591,7 +1533,7 @@ function openPersonViewModal(personId){
         <h2>${esc(fullName(p))}</h2>
         <button class="modal-close">&times;</button>
       </div>
-      <div class="modal-body" id="viewBody">
+      <div class="modal-body">
         <div style="text-align:center;margin-bottom:6px;">
           <div class="view-avatar" id="viewAvatarCircle">${avatarInner}</div>
           <button class="mini-btn" id="changePhotoBtn" style="margin-top:10px;">${p.photoUrl ? 'Изменить фото' : 'Добавить фото'}</button>
@@ -2344,6 +2286,11 @@ let suppressNextClick = false;
 // pointerup checks this so the physical finger lift lands harmlessly no
 // matter which freshly-rebuilt element it happens to end up over.
 let suppressPointerUpId = null;
+// Cancel functions for every currently-pending long-press timer, keyed by
+// nothing in particular — just a bag sceneWrap's own pointerdown can empty
+// out the instant a second finger appears, so a pinch can never be
+// mistaken for someone holding a card.
+const activeLongPressCancels = new Set();
 const DRAG_THRESHOLD = 12; // px of movement before a touch/click counts as a drag, not a tap — above Android's own 8dp "touch slop" standard, since 6 was tight enough that ordinary finger jitter during a tap could misfire as a drag and swallow the click
 
 function recomputePinchState(){
@@ -2360,6 +2307,15 @@ sceneWrap.addEventListener('pointerdown', (e)=>{
   if(activePointers.size === 2){
     dragState = null;
     recomputePinchState();
+    // A second finger touching down means this is (or is about to become) a
+    // pinch, no matter which specific card either finger happens to be
+    // resting on. Any long-press timer already ticking from the FIRST
+    // finger needs to die right here — waiting for a move event to notice
+    // isn't enough, since a finger can sit still for the first moment of a
+    // pinch while the other one starts moving, and even a still first
+    // finger shouldn't still count toward selecting that card.
+    activeLongPressCancels.forEach(cancel=> cancel());
+    activeLongPressCancels.clear();
   } else if(activePointers.size === 1){
     dragState = {id:e.pointerId, startX:e.clientX, startY:e.clientY, startCamX:camera.x, startCamY:camera.y, moved:false};
   }
@@ -2394,6 +2350,7 @@ window.addEventListener('pointermove', (e)=>{
   }
 });
 
+let lastPinchEndAt = 0;
 function endPointer(e){
   if(dragState && e.pointerId === dragState.id){
     if(dragState.moved){
@@ -2403,8 +2360,21 @@ function endPointer(e){
     }
     dragState = null;
   }
+  const wasPinching = activePointers.size >= 2;
   activePointers.delete(e.pointerId);
   recomputePinchState();
+  if(wasPinching && activePointers.size < 2){
+    // Two fingers essentially never lift at the exact same instant — one
+    // always comes up a beat before the other. That remaining finger was
+    // still down purely because it hadn't been lifted YET, not because it
+    // was starting some new, separate touch — but the code below can't
+    // otherwise tell those two apart, since it just sees pointer count drop
+    // to 1 either way. Marking the moment a pinch ends lets a card's own
+    // pointerup handler recognize "this lift is still the tail end of that
+    // pinch" and ignore it, instead of treating the remaining finger's own
+    // lift as a fresh, valid tap on whatever card it happened to land on.
+    lastPinchEndAt = Date.now();
+  }
   if(activePointers.size === 1){
     const [id, pt] = Array.from(activePointers.entries())[0];
     dragState = {id, startX:pt.x, startY:pt.y, startCamX:camera.x, startCamY:camera.y, moved:false};
