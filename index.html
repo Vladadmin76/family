@@ -257,7 +257,7 @@
 <body>
 <div id="app">
   <div id="topbar">
-    <h1>Семейное древо <span id="appVersion" style="font-size:11px;font-weight:400;color:#999;">v0.21</span></h1>
+    <h1>Семейное древо <span id="appVersion" style="font-size:11px;font-weight:400;color:#999;">v0.22</span></h1>
     <div class="spacer"></div>
     <button id="btnSettings" title="Меню">&#9881;</button>
   </div>
@@ -1739,7 +1739,7 @@ function showExportFallback(payload, filename){
   backdrop.innerHTML = `
     <div class="modal">
       <div class="modal-header">
-        <h2>Экспорт данных</h2>
+        <h2>Сохранение данных</h2>
         <button class="modal-close">&times;</button>
       </div>
       <div class="modal-body">
@@ -1813,7 +1813,7 @@ function openExportNameModal(){
   backdrop.innerHTML = `
     <div class="modal">
       <div class="modal-header">
-        <h2>Экспорт древа</h2>
+        <h2>Сохранение древа</h2>
         <button class="modal-close">&times;</button>
       </div>
       <div class="modal-body">
@@ -1822,7 +1822,7 @@ function openExportNameModal(){
           <label>Имя файла</label>
           <input id="exportNameInput" value="${esc(suggested)}">
         </div>
-        <button class="btn primary" id="doExportBtn" style="width:100%;">Экспортировать</button>
+        <button class="btn primary" id="doExportBtn" style="width:100%;">Сохранить</button>
       </div>
     </div>`;
   modalRoot.appendChild(backdrop);
@@ -2442,8 +2442,8 @@ function openSettingsMenu(){
   const pop = document.createElement('div');
   pop.className = 'add-popover';
   pop.innerHTML = `
-    <button data-action="export">Экспорт</button>
-    <button data-action="import">Импорт / Объединить</button>
+    <button data-action="export">Сохранить</button>
+    <button data-action="import">Загрузить или соединить</button>
     <button data-action="description">Описание</button>
     <button data-action="about">О программе</button>
     <button data-action="reset" style="color:var(--danger);">Начать заново</button>
@@ -2475,7 +2475,7 @@ function openDescriptionModal(){
           <li>Построение дерева от себя: родители, супруг(и), дети, братья и сёстры — через кнопку «+» на карточке.</li>
           <li>Фото человека с обрезкой под круг, воспоминания, дата рождения/смерти, отметка «умер(ла)» независимо от того, известны ли точные даты.</li>
           <li>Свободное панорамирование и зум (в том числе жестом «щипок» на телефоне).</li>
-          <li>Экспорт дерева в файл и объединение двух файлов в один — например, когда муж и жена вели свои деревья по отдельности.</li>
+          <li>Сохранение дерева в файл и объединение двух файлов в один — например, когда муж и жена вели свои деревья по отдельности.</li>
           <li><b>Определение родства:</b> долгое нажатие на карточку выделяет её жёлтой рамкой, затем нужно найти и нажать на вторую карточку — откроется окно с точным названием родства между ними (в том числе через брак: тесть, зять, шурин и т.д.). Нажатие на пустое место снимает выделение.</li>
         </ul>
       </div>
@@ -2538,7 +2538,7 @@ function confirmResetAllData(){
     <div class="modal">
       <div class="modal-header"><h2>Начать заново?</h2><button class="modal-close">&times;</button></div>
       <div class="modal-body">
-        <p class="hint-text">Все текущие данные древа будут удалены без возможности восстановления. Если хотите сохранить их — сначала сделайте экспорт.</p>
+        <p class="hint-text">Все текущие данные древа будут удалены без возможности восстановления. Если хотите сохранить их — сначала сделайте сохранение.</p>
         <button class="btn danger" id="confirmResetBtn" style="width:100%;margin-bottom:8px;">Да, удалить всё и начать заново</button>
         <button class="btn" id="cancelResetBtn" style="width:100%;">Отмена</button>
       </div>
